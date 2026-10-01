@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useEffect, useState, useCallback, use } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { projects as projectsApi, type Project } from "@/lib/api";
@@ -47,9 +49,9 @@ export default function ProjectDetailPage({
     setLoading(false);
   }, [token, id]);
 
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     load();
-  }, [load]);
+  }), [load]);
 
   if (loading) {
     return (

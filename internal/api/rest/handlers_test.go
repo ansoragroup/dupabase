@@ -544,8 +544,8 @@ func TestResolveRoleAndClaims_InvalidUserToken(t *testing.T) {
 
 	role, _ := resolveRoleAndClaims(req, project)
 	// Invalid user token should fall back to apikey role
-	if role != "anon" {
-		t.Errorf("expected role 'anon' (fallback), got %q", role)
+	if role != "" {
+		t.Errorf("expected invalid bearer token to be rejected, got role %q", role)
 	}
 }
 

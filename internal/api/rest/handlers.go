@@ -3,6 +3,7 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -46,6 +47,10 @@ func (h *Handler) HandleTable(w http.ResponseWriter, r *http.Request) {
 
 	// Determine the effective role for RLS
 	role, claims := resolveRoleAndClaims(r, project)
+	if !authorizeUserSession(r, project, pool, role, claims) {
+		writeError(w, http.StatusUnauthorized, "PGRST301", "invalid or inactive user session")
+		return
+	}
 
 	// Get schema from Accept-Profile / Content-Profile headers
 	schema := "public"
@@ -62,7 +67,8 @@ func (h *Handler) HandleTable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
 
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
@@ -95,8 +101,13 @@ func (h *Handler) HandleRPC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	role, claims := resolveRoleAndClaims(r, project)
+	if !authorizeUserSession(r, project, pool, role, claims) {
+		writeError(w, http.StatusUnauthorized, "PGRST301", "invalid or inactive user session")
+		return
+	}
 
-	ctx := r.Context()
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
 
 	// Parse function arguments
 	var args map[string]interface{}
@@ -802,6 +813,9 @@ func buildWhereClause(q map[string][]string, schema, table string) (string, []in
 
 		for _, val := range values {
 			cond, condArgs, newIdx := parseFilter(key, val, argIdx)
+			if cond == "" {
+				return "", nil, fmt.Errorf("invalid filter for %s", key)
+			}
 			if cond != "" {
 				conditions = append(conditions, cond)
 				args = append(args, condArgs...)
@@ -1019,11 +1033,25 @@ func resolveRoleAndClaims(r *http.Request, project *database.ProjectRecord) (str
 						role = r
 					}
 				}
+			} else {
+				return "", nil
 			}
 		}
 	}
 
 	return role, claims
+}
+
+func authorizeUserSession(r *http.Request, project *database.ProjectRecord, pool *pgxpool.Pool, role string, claims map[string]interface{}) bool {
+	if role == "" || claims == nil {
+		return false
+	}
+	if role == "authenticated" {
+		if sub, ok := claims["sub"].(string); ok && sub != "" {
+			return database.UserSessionEligible(r.Context(), pool, sub, project.Autoconfirm)
+		}
+	}
+	return true
 }
 
 // allowedSchemas are schemas that can be accessed via the REST API.
@@ -1045,7 +1073,18 @@ func init() {
 
 // isAllowedSchema checks if a schema name is safe to query.
 func isAllowedSchema(schema string) bool {
-	return allowedSchemas[schema]
+	if schema == "auth" || schema == "platform" || schema == "information_schema" || strings.HasPrefix(schema, "pg_") {
+		return false
+	}
+	if allowedSchemas[schema] {
+		return true
+	}
+	for _, s := range strings.Split(os.Getenv("ALLOWED_SCHEMAS"), ",") {
+		if strings.TrimSpace(s) == schema && schema != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func extractTableName(path string) string {
@@ -1073,11 +1112,18 @@ func quoteIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
+var errResponseTooLarge = errors.New("response is too large; request a smaller page")
+
 func collectRows(rows pgx.Rows) (interface{}, error) {
 	defer rows.Close()
 
 	descs := rows.FieldDescriptions()
 	var result []map[string]interface{}
+	maxBytes := 32 * 1024 * 1024
+	if value, err := strconv.Atoi(os.Getenv("REST_MAX_RESPONSE_BYTES")); err == nil && value > 0 {
+		maxBytes = value
+	}
+	responseBytes := 0
 
 	for rows.Next() {
 		values, err := rows.Values()
@@ -1088,6 +1134,14 @@ func collectRows(rows pgx.Rows) (interface{}, error) {
 		row := make(map[string]interface{})
 		for i, desc := range descs {
 			row[string(desc.Name)] = convertPgValue(values[i])
+		}
+		encoded, err := json.Marshal(row)
+		if err != nil {
+			return nil, err
+		}
+		responseBytes += len(encoded) + 1
+		if responseBytes > maxBytes {
+			return nil, errResponseTooLarge
 		}
 		result = append(result, row)
 	}
@@ -1141,6 +1195,9 @@ func convertPgValue(v interface{}) interface{} {
 
 // sanitizeDBError removes internal database details from error messages.
 func sanitizeDBError(err error) string {
+	if errors.Is(err, errResponseTooLarge) {
+		return errResponseTooLarge.Error()
+	}
 	msg := err.Error()
 	// Only expose safe PostgreSQL error patterns to clients
 	if strings.Contains(msg, "violates row-level security") {

@@ -1,3 +1,4 @@
+import { localTestURL } from './local_fixture.mjs';
 /**
  * Admin Feature Test Suite
  *
@@ -14,11 +15,11 @@
  * 10. Edge cases and validation
  */
 
-const API = 'http://localhost:3333';
+const API = localTestURL();
 
-// Admin credentials (from .env)
-const ADMIN_EMAIL = 'admin@dupabase.local';
-const ADMIN_PASSWORD = 'admin-password-change-me';
+const ADMIN_EMAIL = process.env.DUPABASE_TEST_ADMIN_EMAIL;
+const ADMIN_PASSWORD = process.env.DUPABASE_TEST_ADMIN_PASSWORD;
+if (!ADMIN_EMAIL || !ADMIN_PASSWORD) throw new Error('Set the disposable fixture administrator credentials');
 
 // Test user credentials
 const TEST_EMAIL = `admin_test_${Date.now()}@test.com`;
@@ -27,6 +28,9 @@ const TEST_PASSWORD = 'TestPassword123!';
 let passed = 0;
 let failed = 0;
 const failures = [];
+const createdInvites = new Set();
+const createdUsers = new Set();
+let adminToken;
 
 function assert(condition, msg) {
   if (condition) {
@@ -45,11 +49,14 @@ async function api(method, path, body, token) {
   const opts = { method, headers: h };
   if (body && method !== 'GET') opts.body = JSON.stringify(body);
   const res = await fetch(`${API}${path}`, opts);
-  return { status: res.status, data: await res.json().catch(() => null) };
+  const data = await res.json().catch(() => null);
+  if (res.ok && method === 'POST' && path === '/platform/admin/invites' && data?.id) createdInvites.add(data.id);
+  if (res.ok && method === 'POST' && path === '/platform/auth/register' && data?.user?.id) createdUsers.add(data.user.id);
+  return { status: res.status, data };
 }
 
 // Store original registration mode to restore at end
-let originalMode = 'open';
+let originalMode;
 
 async function run() {
   console.log('\n\x1b[1m=== ADMIN FEATURE TEST SUITE ===\x1b[0m\n');
@@ -68,7 +75,8 @@ async function run() {
   assert(adminLoginData?.token, 'Admin login returns token');
   assert(adminLoginData?.user?.is_admin === true, 'Admin user has is_admin=true');
   assert(adminLoginData?.user?.email === ADMIN_EMAIL, 'Admin email matches');
-  const adminToken = adminLoginData?.token;
+  adminToken = adminLoginData?.token;
+  if (!adminToken || !adminLoginData?.user?.is_admin) throw new Error('Disposable administrator login failed');
 
   // 1.2 Admin /me endpoint includes is_admin
   const { status: meStatus, data: meData } = await api('GET', '/platform/auth/me', null, adminToken);
@@ -84,7 +92,8 @@ async function run() {
   const { status: regModeStatus, data: regModeData } = await api('GET', '/platform/auth/registration-mode');
   assert(regModeStatus === 200, 'GET /registration-mode returns 200');
   assert(['open', 'invite', 'disabled'].includes(regModeData?.registration_mode), 'registration_mode is valid');
-  originalMode = regModeData?.registration_mode || 'open';
+  originalMode = regModeData?.registration_mode;
+  if (!['open', 'invite', 'disabled'].includes(originalMode)) throw new Error('Cannot save original registration mode');
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // SECTION 3: Admin Settings
@@ -337,6 +346,11 @@ async function run() {
   });
   assert(delUserLoginStatus === 401, 'Deleted user cannot login');
 
+  const consumedAgain = await api('POST', '/platform/auth/register', {
+    email: `reused_${Date.now()}@test.com`, password: TEST_PASSWORD, invite_code: inv1.code,
+  });
+  assert(consumedAgain.status === 400, 'Deleting an invited user never reopens the invitation');
+
   // 8.5 Delete nonexistent user
   const { status: del404UserStatus } = await api('DELETE', '/platform/admin/users/00000000-0000-0000-0000-000000000000', null, adminToken);
   assert(del404UserStatus === 404, 'Delete nonexistent user returns 404');
@@ -373,19 +387,6 @@ async function run() {
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  // CLEANUP: Restore original mode
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  await api('PUT', '/platform/admin/settings', { registration_mode: originalMode }, adminToken);
-
-  // Clean up remaining test invites
-  const { data: remainingInvites } = await api('GET', '/platform/admin/invites', null, adminToken);
-  for (const inv of remainingInvites || []) {
-    if (!inv.used_by) {
-      await api('DELETE', `/platform/admin/invites/${inv.id}`, null, adminToken);
-    }
-  }
-
-  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // RESULTS
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   console.log(`\n\x1b[1m=== RESULTS ===\x1b[0m`);
@@ -397,12 +398,29 @@ async function run() {
   }
   console.log(`  Total: ${passed + failed}\n`);
 
-  process.exit(failed > 0 ? 1 : 0);
+  process.exitCode = failed > 0 ? 1 : 0;
+}
+
+async function cleanup() {
+  if (!adminToken) return;
+  if (originalMode) {
+    const restored = await api('PUT', '/platform/admin/settings', { registration_mode: originalMode }, adminToken);
+    if (restored.status !== 200) throw new Error('Registration mode restoration failed');
+  }
+  for (const id of createdInvites) {
+    const deleted = await api('DELETE', `/platform/admin/invites/${encodeURIComponent(id)}`, null, adminToken);
+    if (![200, 204, 404].includes(deleted.status)) throw new Error('Test invitation cleanup failed');
+  }
+  for (const id of createdUsers) {
+    const deleted = await api('DELETE', `/platform/admin/users/${encodeURIComponent(id)}`, null, adminToken);
+    if (![200, 204, 404].includes(deleted.status)) throw new Error('Test user cleanup failed');
+  }
 }
 
 run().catch(err => {
-  console.error('\x1b[31mFATAL:\x1b[0m', err);
-  // Restore open mode on crash
-  api('PUT', '/platform/admin/settings', { registration_mode: originalMode }, null)
-    .finally(() => process.exit(1));
+  console.error('\x1b[31mFATAL:\x1b[0m', err.message);
+  process.exitCode = 1;
+}).finally(cleanup).catch(err => {
+  console.error('Cleanup failed:', err.message);
+  process.exitCode = 1;
 });

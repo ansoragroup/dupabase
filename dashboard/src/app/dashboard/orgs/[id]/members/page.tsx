@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useState, useEffect, useCallback } from "react";
 import { useParams } from "next/navigation";
 import { useAuth } from "@/lib/auth-context";
@@ -100,9 +102,9 @@ export default function OrgMembersPage() {
     setLoading(false);
   }, [token, id]);
 
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     loadData();
-  }, [loadData]);
+  }), [loadData]);
 
   const handleInvite = async () => {
     if (!token || !id || !inviteEmail.trim()) return;

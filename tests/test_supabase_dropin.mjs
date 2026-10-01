@@ -1,3 +1,4 @@
+import { localTestURL } from './local_fixture.mjs';
 /**
  * Supabase Drop-in Compatibility Test
  *
@@ -26,7 +27,7 @@ import { writeFileSync, unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-const API_URL = 'http://localhost:3333';
+const API_URL = localTestURL();
 const PLATFORM_PASSWORD = 'Platform$ecure1!';
 
 let passed = 0;

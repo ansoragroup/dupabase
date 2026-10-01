@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useEffect, useState, useCallback, use } from "react";
 import { useAuth } from "@/lib/auth-context";
 import {
@@ -39,13 +41,13 @@ export default function ProjectSettingsPage({
 
   const load = useCallback(async () => {
     if (!token) return;
-    const { data, error } = await projectsApi.list(token);
+    const { data, error } = await projectsApi.get(token, id);
     if (error) {
       toast.error(error);
       setLoading(false);
       return;
     }
-    const found = data?.find((p) => p.id === id);
+    const found = data;
     if (found) {
       setProject(found);
       if (found.settings) {
@@ -55,9 +57,9 @@ export default function ProjectSettingsPage({
     setLoading(false);
   }, [token, id]);
 
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     load();
-  }, [load]);
+  }), [load]);
 
   const handleSave = async () => {
     if (!token || !project) return;

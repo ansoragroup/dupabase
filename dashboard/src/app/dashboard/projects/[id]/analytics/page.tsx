@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useEffect, useState, useCallback, use } from "react";
 import { useAuth } from "@/lib/auth-context";
 import {
@@ -89,9 +91,9 @@ export default function AnalyticsPage({
     setLoading(false);
   }, [token, id]);
 
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     load();
-  }, [load]);
+  }), [load]);
 
   const handleSort = (field: SortField) => {
     if (sortField === field) {

@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import {
   createContext,
   useContext,
@@ -44,9 +46,9 @@ export function OrgProvider({ children }: { children: ReactNode }) {
     setLoading(false);
   }, [token]);
 
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     refreshOrgs();
-  }, [refreshOrgs]);
+  }), [refreshOrgs]);
 
   const setActiveOrg = (org: Organization) => {
     setActiveOrgState(org);

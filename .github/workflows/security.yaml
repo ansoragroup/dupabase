@@ -1,0 +1,107 @@
+name: Security
+
+on:
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: '20 2 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  dependencies:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - name: Go advisories and copied crypto provenance
+        run: |
+          go mod verify
+          go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./cmd/... ./internal/...
+          python3 scripts/update_crypto.py --check
+          python3 scripts/check_crypto_advisories.py
+      - name: Check current upstream crypto
+        if: github.event_name == 'schedule'
+        run: python3 scripts/update_crypto.py --check-latest
+      - name: SDK and dashboard advisories
+        run: |
+          npm ci --ignore-scripts
+          npm audit --audit-level=low
+          npm ci --ignore-scripts --prefix dashboard
+          npm audit --audit-level=low --prefix dashboard
+
+  dependency-review:
+    name: Review dependency changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: low
+          comment-summary-in-pr: never
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [go, javascript-typescript]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        if: matrix.language == 'go'
+        with:
+          go-version-file: go.mod
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.language == 'go' && 'manual' || 'none' }}
+          queries: security-extended
+      - name: Build backend
+        if: matrix.language == 'go'
+        run: go build ./cmd/server
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: '/language:${{ matrix.language }}'
+
+  container:
+    name: Production image advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Build exact revision
+        run: docker build --file .deploy/_shared/Dockerfile --build-arg BUILD_REVISION="$GITHUB_SHA" --tag dupabase:security .
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.75.0
+          image-ref: dupabase:security
+          scanners: vuln
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          ignore-unfixed: false
+          exit-code: '1'
+          format: table

@@ -1,4 +1,5 @@
 "use client";
+import { useRouter } from "next/navigation";
 
 import { useState } from "react";
 import { useAuth } from "@/lib/auth-context";
@@ -16,6 +17,7 @@ import { toast } from "sonner";
 import { Loader2 } from "lucide-react";
 
 export default function SettingsPage() {
+  const router = useRouter();
   const { user, token, loading: authLoading, logout } = useAuth();
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -214,7 +216,7 @@ export default function SettingsPage() {
                 size="sm"
                 onClick={() => {
                   logout();
-                  window.location.href = "/login";
+                  router.push("/login");
                 }}
               >
                 Sign out

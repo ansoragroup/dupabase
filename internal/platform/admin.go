@@ -104,23 +104,60 @@ func (s *AdminService) DeleteUser(ctx context.Context, callerID, targetID string
 	if isAdmin {
 		return http.StatusForbidden, fmt.Errorf("cannot delete an admin user")
 	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("begin user deletion: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	// Prevent new owned organizations/memberships while deletion is checked.
+	if err := tx.QueryRow(ctx, `SELECT is_admin FROM platform.users WHERE id=$1 FOR UPDATE`, targetID).Scan(&isAdmin); err != nil {
+		return http.StatusNotFound, fmt.Errorf("user not found")
+	}
+	if isAdmin {
+		return http.StatusForbidden, fmt.Errorf("cannot delete an admin user")
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM platform.organizations WHERE created_by=$1 FOR UPDATE`, targetID); err != nil {
+		return http.StatusInternalServerError, err
+	}
+	var shared bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM platform.organizations o WHERE o.created_by=$1 AND (EXISTS(SELECT 1 FROM platform.org_members m WHERE m.org_id=o.id AND m.user_id<>$1) OR EXISTS(SELECT 1 FROM platform.projects p WHERE p.org_id=o.id AND p.user_id<>$1)))`, targetID).Scan(&shared); err != nil {
+		return http.StatusInternalServerError, err
+	}
+	if shared {
+		return http.StatusBadRequest, fmt.Errorf("cannot delete the owner of an organization with other members")
+	}
 
 	// Clean up project databases before deleting the user
 	rows, err := s.db.Query(ctx, `SELECT id, db_name FROM platform.projects WHERE user_id = $1`, targetID)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var projectID, dbName string
-			if err := rows.Scan(&projectID, &dbName); err == nil && dbName != "" {
-				if _, err := s.db.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %s`, adminQuoteIdent(dbName))); err != nil {
-					slog.Warn("failed to drop project database", "db", dbName, "error", err)
-				} else {
-					slog.Info("dropped project database during user deletion", "db", dbName, "user_id", targetID)
-				}
-				// Close the connection pool for this project
-				if s.poolManager != nil {
-					s.poolManager.ClosePool(projectID)
-				}
+	if err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("list account projects: %w", err)
+	}
+	type accountProject struct{ id, dbName string }
+	var projects []accountProject
+	for rows.Next() {
+		var project accountProject
+		if err := rows.Scan(&project.id, &project.dbName); err != nil {
+			rows.Close()
+			return http.StatusInternalServerError, err
+		}
+		projects = append(projects, project)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return http.StatusInternalServerError, err
+	}
+	for _, project := range projects {
+		if s.poolManager != nil {
+			s.poolManager.ClosePool(project.id)
+		}
+		if _, err := s.db.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS %s WITH (FORCE)`, adminQuoteIdent(project.dbName))); err != nil {
+			return http.StatusInternalServerError, fmt.Errorf("drop account project database: %w", err)
+		}
+		if cleaner, ok := s.poolManager.(interface {
+			DropProjectLogin(context.Context, string) error
+		}); ok {
+			if err := cleaner.DropProjectLogin(ctx, project.id); err != nil {
+				return http.StatusInternalServerError, fmt.Errorf("drop account project login: %w", err)
 			}
 		}
 	}
@@ -130,16 +167,36 @@ func (s *AdminService) DeleteUser(ctx context.Context, callerID, targetID string
 	_ = s.db.QueryRow(ctx, `SELECT pg_username FROM platform.pg_users WHERE user_id = $1`, targetID).Scan(&pgUsername)
 	if pgUsername != "" {
 		if _, err := s.db.Exec(ctx, fmt.Sprintf(`DROP ROLE IF EXISTS %s`, adminQuoteIdent(pgUsername))); err != nil {
-			slog.Warn("failed to drop PG role", "role", pgUsername, "error", err)
+			return http.StatusInternalServerError, fmt.Errorf("drop account PostgreSQL role: %w", err)
 		} else {
 			slog.Info("dropped PG role during user deletion", "role", pgUsername, "user_id", targetID)
 		}
 	}
 
 	// Delete user (CASCADE will clean up pg_users, projects, etc.)
-	_, err = s.db.Exec(ctx, `DELETE FROM platform.users WHERE id = $1`, targetID)
+	// Keep the invitation's consumption timestamp while releasing its user FK.
+	// Expire it in the same transaction so deleting a user never reopens a code.
+	_, err = tx.Exec(ctx, `UPDATE platform.invites SET used_by=NULL, expires_at=LEAST(expires_at,NOW()) WHERE used_by=$1`, targetID)
+	if err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("retire user invitations: %w", err)
+	}
+	// Account deletion also removes its private workspaces and invitations it
+	// issued. Shared workspaces were rejected above before any database cleanup.
+	if _, err := tx.Exec(ctx, `DELETE FROM platform.org_invites WHERE invited_by=$1`, targetID); err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("retire organization invitations: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM platform.projects WHERE user_id=$1`, targetID); err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("delete account project records: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM platform.organizations WHERE created_by=$1`, targetID); err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("delete private organizations: %w", err)
+	}
+	_, err = tx.Exec(ctx, `DELETE FROM platform.users WHERE id = $1`, targetID)
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("delete user: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("commit user deletion: %w", err)
 	}
 	return http.StatusOK, nil
 }

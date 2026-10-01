@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -183,7 +184,7 @@ func (s *Server) registerRoutes() {
 			json.NewEncoder(w).Encode(map[string]string{"status": "unhealthy"})
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "revision": BuildRevision})
 	})
 
 	// Platform auth (no auth required, rate-limited)
@@ -377,7 +378,14 @@ func (s *Server) handleListProjects(w http.ResponseWriter, r *http.Request) {
 		dupaHTTP.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
+	if !platform.HasMinRole(role, "developer") {
+		for i := range projects {
+			projects[i].ServiceRoleKey = ""
+			projects[i].JWTSecret = ""
+		}
+	}
 	dupaHTTP.WriteJSON(w, http.StatusOK, projects)
+
 }
 
 func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
@@ -408,6 +416,10 @@ func (s *Server) handleGetProject(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		dupaHTTP.WriteJSON(w, status, map[string]string{"error": err.Error()})
 		return
+	}
+	if !platform.HasMinRole(role, "developer") {
+		project.ServiceRoleKey = ""
+		project.JWTSecret = ""
 	}
 	dupaHTTP.WriteJSON(w, status, project)
 }
@@ -1282,6 +1294,12 @@ func (s *Server) handleExportDatabase(w http.ResponseWriter, r *http.Request) {
 	}
 	defer reader.Close()
 
+	stream := bufio.NewReader(reader)
+	if _, err := stream.Peek(1); err != nil {
+		dupaHTTP.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "export failed: no dump data produced"})
+		return
+	}
+
 	contentType := "application/octet-stream"
 	if format == "sql" || format == "plain" {
 		contentType = "application/sql"
@@ -1292,8 +1310,13 @@ func (s *Server) handleExportDatabase(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition")
 	w.WriteHeader(http.StatusOK)
 
-	if _, err := io.Copy(w, reader); err != nil {
+	if _, err := io.Copy(w, stream); err != nil {
 		slog.Error("export stream error", "project_id", projectID, "error", err)
+		panic(http.ErrAbortHandler)
+	}
+	if err := reader.Close(); err != nil {
+		slog.Error("export command failed", "project_id", projectID, "error", err)
+		panic(http.ErrAbortHandler)
 	}
 
 	s.auditService.Log(r.Context(), &userID, "export_database", "project", projectID, r, map[string]interface{}{"format": format})
@@ -1371,7 +1394,7 @@ func (s *Server) handleStartImport(w http.ResponseWriter, r *http.Request) {
 	destName := fmt.Sprintf("%s_%s", hex.EncodeToString(randBytes), header.Filename)
 	destPath := filepath.Join(dir, destName)
 
-	dest, err := os.Create(destPath)
+	dest, err := os.OpenFile(destPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		dupaHTTP.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save file"})
 		return
@@ -2104,7 +2127,7 @@ func (s *Server) handleUpdateRow(w http.ResponseWriter, r *http.Request) {
 	}
 	pkColumn := r.URL.Query().Get("pk_column")
 	pkValue := r.URL.Query().Get("pk_value")
-	if pkColumn == "" || pkValue == "" {
+	if pkColumn == "" || !r.URL.Query().Has("pk_value") {
 		dupaHTTP.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "pk_column and pk_value query params required"})
 		return
 	}
@@ -2153,7 +2176,7 @@ func (s *Server) handleDeleteRow(w http.ResponseWriter, r *http.Request) {
 	}
 	pkColumn := r.URL.Query().Get("pk_column")
 	pkValue := r.URL.Query().Get("pk_value")
-	if pkColumn == "" || pkValue == "" {
+	if pkColumn == "" || !r.URL.Query().Has("pk_value") {
 		dupaHTTP.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "pk_column and pk_value query params required"})
 		return
 	}

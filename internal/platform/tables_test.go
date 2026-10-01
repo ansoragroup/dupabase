@@ -91,7 +91,7 @@ func TestValidateSchemaTable(t *testing.T) {
 		errMsg  string
 	}{
 		{"valid_public_users", "public", "users", false, ""},
-		{"valid_auth_sessions", "auth", "sessions", false, ""},
+		{"protected_auth_sessions", "auth", "sessions", true, "access to this schema is not allowed"},
 		{"valid_with_underscores", "my_schema", "my_table", false, ""},
 		{"invalid_schema_empty", "", "users", true, "invalid schema name"},
 		{"invalid_schema_number_start", "1schema", "users", true, "invalid schema name"},

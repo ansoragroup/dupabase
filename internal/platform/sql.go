@@ -48,6 +48,8 @@ func (s *SQLService) ExecuteSQL(ctx context.Context, projectID string, req SQLRe
 	if query == "" {
 		return nil, http.StatusBadRequest, fmt.Errorf("query is required")
 	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 
 	pool, err := s.poolManager.GetPool(ctx, projectID)
 	if err != nil {
@@ -59,7 +61,13 @@ func (s *SQLService) ExecuteSQL(ctx context.Context, projectID string, req SQLRe
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("acquire connection: %w", err)
 	}
-	defer conn.Release()
+	// Arbitrary SQL can alter session state. Destroy this connection rather than
+	// returning changed roles/settings/prepared statements to API traffic.
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = conn.Hijack().Close(closeCtx)
+	}()
 
 	// Set timeout to prevent runaway queries
 	_, err = conn.Exec(ctx, "SET statement_timeout = '30s'")
@@ -89,6 +97,7 @@ func (s *SQLService) ExecuteSQL(ctx context.Context, projectID string, req SQLRe
 		defer rows.Close()
 
 		result, statusCode, resultErr := scanQueryResults(rows)
+		rows.Close()
 		if resultErr != nil {
 			return nil, statusCode, resultErr
 		}

@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useEffect, useState, useCallback, use } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { logs as logsApi, type LogEntry } from "@/lib/api";
@@ -7,7 +9,6 @@ import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -106,9 +107,9 @@ export default function LogsPage({
     setLoading(false);
   }, [token, id, page, actionFilter, fromDate, toDate]);
 
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     loadLogs();
-  }, [loadLogs]);
+  }), [loadLogs]);
 
   const applyFilters = () => {
     setPage(1);

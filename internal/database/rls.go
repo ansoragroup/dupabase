@@ -28,25 +28,6 @@ func ExecuteWithRLS[T any](
 ) (T, error) {
 	var zero T
 
-	// service_role bypasses RLS — run without SET LOCAL ROLE
-	if role == "service_role" {
-		tx, err := pool.Begin(ctx)
-		if err != nil {
-			return zero, fmt.Errorf("begin tx: %w", err)
-		}
-		defer tx.Rollback(ctx)
-
-		result, err := fn(tx)
-		if err != nil {
-			return zero, err
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return zero, fmt.Errorf("commit tx: %w", err)
-		}
-		return result, nil
-	}
-
 	// Validate role name to prevent SQL injection (SET LOCAL ROLE doesn't support $1)
 	if !validRoleName.MatchString(role) {
 		return zero, fmt.Errorf("invalid role name: %s", role)

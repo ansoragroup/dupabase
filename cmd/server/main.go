@@ -70,6 +70,8 @@ func main() {
 	}
 	backupService := platform.NewBackupService(platformPool, cfg.DatabaseURL, backupKey)
 	importService := platform.NewImportService(platformPool, cfg.DatabaseURL)
+	importService.SetPoolManager(poolManager)
+	backupService.SetProjectServices(poolManager, importService)
 	orgService := platform.NewOrgService(platformPool)
 	analyticsService := platform.NewAnalyticsService(platformPool, poolManager)
 	tableService := platform.NewTableService(platformPool, poolManager)
@@ -389,5 +391,6 @@ CREATE INDEX IF NOT EXISTS idx_backup_settings_org_id ON platform.backup_setting
 CREATE INDEX IF NOT EXISTS idx_backup_history_project ON platform.backup_history(project_id);
 `,
 		},
+		platform.BackupMaintenanceMigration,
 	}
 }

@@ -1,3 +1,6 @@
+const query = (values: Record<string, string | number>) => `?${new URLSearchParams(Object.entries(values).map(([key, value]) => [key, String(value)]))}`;
+const segment = (value: string | number) => encodeURIComponent(String(value));
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3333";
 
 interface ApiOptions {
@@ -57,9 +60,9 @@ export const platformAuth = {
 // Projects
 export const projects = {
   list: (token: string, orgId?: string) =>
-    api<Project[]>(`/platform/projects${orgId ? `?org_id=${orgId}` : ''}`, { token }),
+    api<Project[]>(`/platform/projects${orgId ? query({org_id: orgId}) : ""}`, { token }),
   get: (token: string, id: string) =>
-    api<Project>(`/platform/projects/${id}`, { token }),
+    api<Project>(`/platform/projects/${segment(id)}`, { token }),
   create: (token: string, name: string, orgId?: string) =>
     api<Project>("/platform/projects", {
       method: "POST",
@@ -67,12 +70,12 @@ export const projects = {
       token,
     }),
   delete: (token: string, id: string) =>
-    api<{ message: string }>(`/platform/projects/${id}`, {
+    api<{ message: string }>(`/platform/projects/${segment(id)}`, {
       method: "DELETE",
       token,
     }),
   updateSettings: (token: string, id: string, settings: Partial<ProjectSettings>) =>
-    api<ProjectSettings>(`/platform/projects/${id}/settings`, {
+    api<ProjectSettings>(`/platform/projects/${segment(id)}/settings`, {
       method: "PATCH",
       body: settings,
       token,
@@ -104,7 +107,7 @@ export const imports = {
     if (options.migrate_auth_users) formData.append("migrate_auth_users", "true");
     try {
       const res = await fetch(
-        `${API_URL}/platform/projects/${projectId}/import`,
+        `${API_URL}/platform/projects/${segment(projectId)}/import`,
         {
           method: "POST",
           headers: { Authorization: `Bearer ${token}` },
@@ -119,11 +122,11 @@ export const imports = {
     }
   },
   status: (token: string, projectId: string, taskId: number) =>
-    api<ImportTask>(`/platform/projects/${projectId}/import/${taskId}`, { token }),
+    api<ImportTask>(`/platform/projects/${segment(projectId)}/import/${segment(taskId)}`, { token }),
   history: (token: string, projectId: string) =>
-    api<ImportTask[]>(`/platform/projects/${projectId}/import/history`, { token }),
+    api<ImportTask[]>(`/platform/projects/${segment(projectId)}/import/history`, { token }),
   cancel: (token: string, projectId: string, taskId: number) =>
-    api<{ status: string }>(`/platform/projects/${projectId}/import/${taskId}/cancel`, {
+    api<{ status: string }>(`/platform/projects/${segment(projectId)}/import/${segment(taskId)}/cancel`, {
       method: "POST",
       token,
     }),
@@ -131,7 +134,7 @@ export const imports = {
     const formData = new FormData();
     formData.append("file", file);
     try {
-      const res = await fetch(`${API_URL}/platform/projects/${projectId}/import/analyze`, {
+      const res = await fetch(`${API_URL}/platform/projects/${segment(projectId)}/import/analyze`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
         body: formData,
@@ -148,7 +151,7 @@ export const imports = {
 // Backups
 export const backups = {
   getSettings: (token: string, orgId?: string) =>
-    api<BackupSettings>(`/platform/backups/settings${orgId ? `?org_id=${orgId}` : ''}`, { token }),
+    api<BackupSettings>(`/platform/backups/settings${orgId ? query({org_id: orgId}) : ""}`, { token }),
   saveSettings: (token: string, settings: SaveBackupSettingsRequest) =>
     api<BackupSettings>("/platform/backups/settings", {
       method: "POST",
@@ -156,9 +159,9 @@ export const backups = {
       token,
     }),
   getHistory: (token: string, orgId?: string) =>
-    api<BackupHistoryItem[]>(`/platform/backups/history${orgId ? `?org_id=${orgId}` : ''}`, { token }),
+    api<BackupHistoryItem[]>(`/platform/backups/history${orgId ? query({org_id: orgId}) : ""}`, { token }),
   runNow: (token: string, orgId?: string) =>
-    api<{ status: string }>(`/platform/backups/run${orgId ? `?org_id=${orgId}` : ''}`, {
+    api<{ status: string }>(`/platform/backups/run${orgId ? query({org_id: orgId}) : ""}`, {
       method: "POST",
       token,
     }),
@@ -168,14 +171,14 @@ export const backups = {
       body: config,
       token,
     }),
-  toggleEnabled: (token: string, enabled: boolean, platformPassword: string) =>
+  toggleEnabled: (token: string, enabled: boolean, platformPassword: string, orgId?: string) =>
     api<BackupSettings>("/platform/backups/settings", {
       method: "PATCH",
-      body: { enabled, platform_password: platformPassword },
+      body: { enabled, platform_password: platformPassword, ...(orgId ? {org_id: orgId} : {}) },
       token,
     }),
   restoreBackup: (token: string, historyId: number, platformPassword: string) =>
-    api<{ task_id: number; status: string }>(`/platform/backups/${historyId}/restore`, {
+    api<{ task_id: number; status: string }>(`/platform/backups/${segment(historyId)}/restore`, {
       method: "POST",
       body: { platform_password: platformPassword },
       token,
@@ -190,9 +193,9 @@ export const registrationMode = {
 // Admin
 export const admin = {
   getUsers: (token: string, page = 1, perPage = 20) =>
-    api<PaginatedUsers>(`/platform/admin/users?page=${page}&per_page=${perPage}`, { token }),
+    api<PaginatedUsers>(`/platform/admin/users${query({page, per_page: perPage})}`, { token }),
   deleteUser: (token: string, id: string) =>
-    api<{ status: string }>(`/platform/admin/users/${id}`, {
+    api<{ status: string }>(`/platform/admin/users/${segment(id)}`, {
       method: "DELETE",
       token,
     }),
@@ -213,7 +216,7 @@ export const admin = {
       token,
     }),
   deleteInvite: (token: string, id: string) =>
-    api<{ status: string }>(`/platform/admin/invites/${id}`, {
+    api<{ status: string }>(`/platform/admin/invites/${segment(id)}`, {
       method: "DELETE",
       token,
     }),
@@ -230,46 +233,46 @@ export const orgs = {
   list: (token: string) =>
     api<Organization[]>("/platform/orgs", { token }),
   get: (token: string, id: string) =>
-    api<OrgDetail>(`/platform/orgs/${id}`, { token }),
+    api<OrgDetail>(`/platform/orgs/${segment(id)}`, { token }),
   update: (token: string, id: string, data: { name?: string; slug?: string }) =>
-    api<Organization>(`/platform/orgs/${id}`, {
+    api<Organization>(`/platform/orgs/${segment(id)}`, {
       method: "PATCH",
       body: data,
       token,
     }),
   delete: (token: string, id: string) =>
-    api<{ status: string }>(`/platform/orgs/${id}`, {
+    api<{ status: string }>(`/platform/orgs/${segment(id)}`, {
       method: "DELETE",
       token,
     }),
   listMembers: (token: string, id: string) =>
-    api<OrgMember[]>(`/platform/orgs/${id}/members`, { token }),
+    api<OrgMember[]>(`/platform/orgs/${segment(id)}/members`, { token }),
   createInvite: (token: string, id: string, email: string, role: string) =>
-    api<OrgInvite>(`/platform/orgs/${id}/invites`, {
+    api<OrgInvite>(`/platform/orgs/${segment(id)}/invites`, {
       method: "POST",
       body: { email, role },
       token,
     }),
   acceptInvite: (token: string, inviteToken: string) =>
-    api<Organization>(`/platform/orgs/invites/${inviteToken}/accept`, {
+    api<Organization>(`/platform/orgs/invites/${segment(inviteToken)}/accept`, {
       method: "POST",
       token,
     }),
   removeMember: (token: string, id: string, userId: string) =>
-    api<{ status: string }>(`/platform/orgs/${id}/members/${userId}`, {
+    api<{ status: string }>(`/platform/orgs/${segment(id)}/members/${segment(userId)}`, {
       method: "DELETE",
       token,
     }),
   updateMemberRole: (token: string, id: string, userId: string, role: string) =>
-    api<{ status: string }>(`/platform/orgs/${id}/members/${userId}`, {
+    api<{ status: string }>(`/platform/orgs/${segment(id)}/members/${segment(userId)}`, {
       method: "PATCH",
       body: { role },
       token,
     }),
   listInvites: (token: string, id: string) =>
-    api<OrgInvite[]>(`/platform/orgs/${id}/invites`, { token }),
+    api<OrgInvite[]>(`/platform/orgs/${segment(id)}/invites`, { token }),
   revokeInvite: (token: string, id: string, inviteId: string) =>
-    api<{ status: string }>(`/platform/orgs/${id}/invites/${inviteId}`, {
+    api<{ status: string }>(`/platform/orgs/${segment(id)}/invites/${segment(inviteId)}`, {
       method: "DELETE",
       token,
     }),
@@ -459,6 +462,8 @@ export interface TableInfo {
 }
 
 export interface ColumnInfo {
+  primary_key?: boolean;
+  unique?: boolean;
   name: string;
   type: string;
   nullable: boolean;
@@ -469,7 +474,7 @@ export interface ColumnInfo {
 
 export interface TableRowsResponse {
   columns: string[];
-  rows: any[][];
+  rows: unknown[][];
   total: number;
   page: number;
   per_page: number;
@@ -483,7 +488,7 @@ export interface SQLRequest {
 
 export interface SQLResponse {
   columns: string[];
-  rows: any[][];
+  rows: unknown[][];
   row_count: number;
   execution_time_ms: number;
 }
@@ -503,8 +508,8 @@ export interface AuthUserInfo {
 }
 
 export interface AuthUserDetail extends AuthUserInfo {
-  app_metadata: any;
-  user_metadata: any;
+  app_metadata: unknown;
+  user_metadata: unknown;
   sessions: AuthSessionInfo[];
 }
 
@@ -532,7 +537,7 @@ export interface LogEntry {
   resource_id: string | null;
   ip_address: string | null;
   user_agent: string | null;
-  metadata: any;
+  metadata: unknown;
   created_at: string;
 }
 
@@ -605,57 +610,57 @@ export interface OverviewAnalytics {
 // Tables
 export const tables = {
   list: (token: string, projectId: string) =>
-    api<TableInfo[]>(`/platform/projects/${projectId}/tables`, { token }),
+    api<TableInfo[]>(`/platform/projects/${segment(projectId)}/tables`, { token }),
   columns: (token: string, projectId: string, table: string, schema = "public") =>
-    api<ColumnInfo[]>(`/platform/projects/${projectId}/tables/${table}/columns?schema=${schema}`, { token }),
+    api<ColumnInfo[]>(`/platform/projects/${segment(projectId)}/tables/${segment(table)}/columns${query({schema})}`, { token }),
   rows: (token: string, projectId: string, table: string, params: { schema?: string; page?: number; perPage?: number; orderBy?: string; orderDir?: string }) =>
-    api<TableRowsResponse>(`/platform/projects/${projectId}/tables/${table}/rows?schema=${params.schema || "public"}&page=${params.page || 1}&per_page=${params.perPage || 50}&order_by=${params.orderBy || ""}&order_dir=${params.orderDir || ""}`, { token }),
+    api<TableRowsResponse>(`/platform/projects/${segment(projectId)}/tables/${segment(table)}/rows${query({schema: params.schema || "public", page: params.page || 1, per_page: params.perPage || 50, order_by: params.orderBy || "", order_dir: params.orderDir || ""})}`, { token }),
   insertRow: (token: string, projectId: string, table: string, data: Record<string, unknown>, schema = "public") =>
-    api<any>(`/platform/projects/${projectId}/tables/${table}/rows?schema=${schema}`, { method: "POST", token, body: data }),
+    api<unknown>(`/platform/projects/${segment(projectId)}/tables/${segment(table)}/rows${query({schema})}`, { method: "POST", token, body: data }),
   updateRow: (token: string, projectId: string, table: string, pkColumn: string, pkValue: string, data: Record<string, unknown>, schema = "public") =>
-    api<any>(`/platform/projects/${projectId}/tables/${table}/rows?schema=${schema}&pk_column=${pkColumn}&pk_value=${pkValue}`, { method: "PATCH", token, body: data }),
+    api<unknown>(`/platform/projects/${segment(projectId)}/tables/${segment(table)}/rows${query({schema, pk_column: pkColumn, pk_value: pkValue})}`, { method: "PATCH", token, body: data }),
   deleteRow: (token: string, projectId: string, table: string, pkColumn: string, pkValue: string, schema = "public") =>
-    api<any>(`/platform/projects/${projectId}/tables/${table}/rows?schema=${schema}&pk_column=${pkColumn}&pk_value=${pkValue}`, { method: "DELETE", token }),
+    api<unknown>(`/platform/projects/${segment(projectId)}/tables/${segment(table)}/rows${query({schema, pk_column: pkColumn, pk_value: pkValue})}`, { method: "DELETE", token }),
 };
 
 // SQL
 export const sql = {
   execute: (token: string, projectId: string, query: string, readOnly = false) =>
-    api<SQLResponse>(`/platform/projects/${projectId}/sql`, { method: "POST", token, body: { query, read_only: readOnly } }),
+    api<SQLResponse>(`/platform/projects/${segment(projectId)}/sql`, { method: "POST", token, body: { query, read_only: readOnly } }),
 };
 
 // Auth Users
 export const authUsers = {
   list: (token: string, projectId: string, params?: { page?: number; perPage?: number; search?: string }) =>
-    api<AuthUserListResponse>(`/platform/projects/${projectId}/auth/users?page=${params?.page || 1}&per_page=${params?.perPage || 50}&search=${params?.search || ""}`, { token }),
+    api<AuthUserListResponse>(`/platform/projects/${segment(projectId)}/auth/users${query({page: params?.page || 1, per_page: params?.perPage || 50, search: params?.search || ""})}`, { token }),
   get: (token: string, projectId: string, userId: string) =>
-    api<AuthUserDetail>(`/platform/projects/${projectId}/auth/users/${userId}`, { token }),
+    api<AuthUserDetail>(`/platform/projects/${segment(projectId)}/auth/users/${segment(userId)}`, { token }),
   delete: (token: string, projectId: string, userId: string) =>
-    api<any>(`/platform/projects/${projectId}/auth/users/${userId}`, { method: "DELETE", token }),
+    api<unknown>(`/platform/projects/${segment(projectId)}/auth/users/${segment(userId)}`, { method: "DELETE", token }),
   ban: (token: string, projectId: string, userId: string) =>
-    api<any>(`/platform/projects/${projectId}/auth/users/${userId}/ban`, { method: "POST", token }),
+    api<unknown>(`/platform/projects/${segment(projectId)}/auth/users/${segment(userId)}/ban`, { method: "POST", token }),
   unban: (token: string, projectId: string, userId: string) =>
-    api<any>(`/platform/projects/${projectId}/auth/users/${userId}/unban`, { method: "POST", token }),
+    api<unknown>(`/platform/projects/${segment(projectId)}/auth/users/${segment(userId)}/unban`, { method: "POST", token }),
 };
 
 // Logs
 export const logs = {
   list: (token: string, projectId: string, params?: { page?: number; action?: string; from?: string; to?: string }) =>
-    api<{ logs: LogEntry[]; page: number }>(`/platform/projects/${projectId}/logs?page=${params?.page || 1}&action=${params?.action || ""}&from=${params?.from || ""}&to=${params?.to || ""}`, { token }),
+    api<{ logs: LogEntry[]; page: number }>(`/platform/projects/${segment(projectId)}/logs${query({page: params?.page || 1, action: params?.action || "", from: params?.from || "", to: params?.to || ""})}`, { token }),
 };
 
 // Analytics
 export const analytics = {
   overview: (token: string, projectId: string) =>
-    api<OverviewAnalytics>(`/platform/projects/${projectId}/analytics/overview`, { token }),
+    api<OverviewAnalytics>(`/platform/projects/${segment(projectId)}/analytics/overview`, { token }),
   database: (token: string, projectId: string) =>
-    api<DatabaseAnalytics>(`/platform/projects/${projectId}/analytics/database`, { token }),
+    api<DatabaseAnalytics>(`/platform/projects/${segment(projectId)}/analytics/database`, { token }),
   connections: (token: string, projectId: string) =>
-    api<ConnectionAnalytics>(`/platform/projects/${projectId}/analytics/connections`, { token }),
+    api<ConnectionAnalytics>(`/platform/projects/${segment(projectId)}/analytics/connections`, { token }),
   queries: (token: string, projectId: string) =>
-    api<QueryAnalytics>(`/platform/projects/${projectId}/analytics/queries`, { token }),
+    api<QueryAnalytics>(`/platform/projects/${segment(projectId)}/analytics/queries`, { token }),
   auth: (token: string, projectId: string) =>
-    api<AuthAnalytics>(`/platform/projects/${projectId}/analytics/auth`, { token }),
+    api<AuthAnalytics>(`/platform/projects/${segment(projectId)}/analytics/auth`, { token }),
   apiUsage: (token: string, projectId: string) =>
-    api<APIUsageAnalytics>(`/platform/projects/${projectId}/analytics/api-usage`, { token }),
+    api<APIUsageAnalytics>(`/platform/projects/${segment(projectId)}/analytics/api-usage`, { token }),
 };

@@ -1,3 +1,4 @@
+import { localTestURL } from './local_fixture.mjs';
 /**
  * Comprehensive supabase-js compatibility test
  *
@@ -11,7 +12,7 @@
  */
 import { createClient } from '@supabase/supabase-js';
 
-const API_URL = 'http://localhost:3333';
+const API_URL = localTestURL();
 const PLATFORM_EMAIL = `fulltest_${Date.now()}@test.com`;
 const PLATFORM_PASSWORD = 'TestPassword123!';
 

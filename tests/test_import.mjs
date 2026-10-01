@@ -1,3 +1,4 @@
+import { localTestURL } from './local_fixture.mjs';
 /**
  * E2E Import Feature Test Suite
  *
@@ -17,7 +18,7 @@ import { execSync } from 'child_process';
 import { writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
 import path from 'path';
 
-const API = 'http://localhost:3333';
+const API = localTestURL();
 const PG_HOST = 'localhost';
 const PG_PORT = 15432;
 const PG_USER = 'stech';

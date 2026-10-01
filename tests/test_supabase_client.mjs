@@ -1,8 +1,11 @@
+import { localTestURL } from './local_fixture.mjs';
 import { createClient } from '@supabase/supabase-js';
 
-const SUPABASE_URL = 'http://localhost:3333';
-const ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjIwODU3MzQxNTgsImlhdCI6MTc3MDM3NDE1OCwiaXNzIjoic3VwYWJhc2UiLCJwcm9qZWN0X2lkIjoiZDVkNGE4MjctNDJiMi00OGYxLTgxZTYtMDA2YTQzNDEzMTkzIiwicm9sZSI6ImFub24ifQ.IW3sk9dQC1fcrlqMZseII2wuwFraxv6hYCClw3UusHU';
-const SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjIwODU3MzQxNTgsImlhdCI6MTc3MDM3NDE1OCwiaXNzIjoic3VwYWJhc2UiLCJwcm9qZWN0X2lkIjoiZDVkNGE4MjctNDJiMi00OGYxLTgxZTYtMDA2YTQzNDEzMTkzIiwicm9sZSI6InNlcnZpY2Vfcm9sZSJ9.Qz429DPQ6uCDRY-nG5EpkpMgO4DbQrJZkaMMdtwOi5Y';
+const SUPABASE_URL = localTestURL();
+const ANON_KEY = process.env.DUPABASE_TEST_ANON_KEY;
+const SERVICE_ROLE_KEY = process.env.DUPABASE_TEST_SERVICE_ROLE_KEY;
+
+if (!ANON_KEY || !SERVICE_ROLE_KEY) throw new Error('Set DUPABASE_TEST_ANON_KEY and DUPABASE_TEST_SERVICE_ROLE_KEY for the disposable project');
 
 const supabase = createClient(SUPABASE_URL, ANON_KEY);
 const adminClient = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);

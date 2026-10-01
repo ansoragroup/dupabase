@@ -108,7 +108,7 @@ func (s *AuthUserService) ListAuthUsers(ctx context.Context, projectID string, p
 	// Query users
 	rows, err := pool.Query(ctx, `
 		SELECT id, email, phone, email_confirmed_at, phone_confirmed_at,
-			last_sign_in_at, is_anonymous, banned_until, created_at, updated_at
+			last_sign_in_at, is_anonymous, CASE WHEN banned_until='infinity'::timestamptz THEN '9999-12-31 23:59:59+00'::timestamptz ELSE banned_until END, created_at, updated_at
 		FROM auth.users
 		WHERE ($1 = '' OR email ILIKE '%' || $1 || '%' OR phone ILIKE '%' || $1 || '%')
 		ORDER BY created_at DESC
@@ -151,7 +151,7 @@ func (s *AuthUserService) GetAuthUser(ctx context.Context, projectID, userID str
 	var detail AuthUserDetail
 	err = pool.QueryRow(ctx, `
 		SELECT id, email, phone, email_confirmed_at, phone_confirmed_at,
-			last_sign_in_at, is_anonymous, banned_until,
+			last_sign_in_at, is_anonymous, CASE WHEN banned_until='infinity'::timestamptz THEN '9999-12-31 23:59:59+00'::timestamptz ELSE banned_until END,
 			raw_app_meta_data, raw_user_meta_data, created_at, updated_at
 		FROM auth.users WHERE id = $1
 	`, userID).Scan(
@@ -223,7 +223,12 @@ func (s *AuthUserService) BanAuthUser(ctx context.Context, projectID, userID str
 		return http.StatusNotFound, fmt.Errorf("project not found")
 	}
 
-	tag, err := pool.Exec(ctx, `
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `
 		UPDATE auth.users SET banned_until = 'infinity', updated_at = NOW() WHERE id = $1
 	`, userID)
 	if err != nil {
@@ -235,6 +240,12 @@ func (s *AuthUserService) BanAuthUser(ctx context.Context, projectID, userID str
 	}
 
 	slog.Info("auth user banned", "project_id", projectID, "user_id", userID)
+	if _, err := tx.Exec(ctx, `UPDATE auth.refresh_tokens SET revoked=true,updated_at=NOW() WHERE user_id=$1`, userID); err != nil {
+		return http.StatusInternalServerError, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return http.StatusInternalServerError, err
+	}
 	return http.StatusOK, nil
 }
 

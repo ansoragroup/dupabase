@@ -71,6 +71,11 @@ func (pm *PoolManager) PlatformPool() *pgxpool.Pool {
 	return pm.platformPool
 }
 
+// Config returns the startup defaults used for provisioning new projects.
+func (pm *PoolManager) Config() *config.Config {
+	return pm.cfg
+}
+
 // GetProject looks up a project by ID with caching.
 func (pm *PoolManager) GetProject(ctx context.Context, projectID string) (*ProjectRecord, error) {
 	pm.mu.RLock()
@@ -142,8 +147,17 @@ func (pm *PoolManager) GetPool(ctx context.Context, projectID string) (*pgxpool.
 		pm.evictLRULocked()
 	}
 
-	// Build connection URL for this database
-	dbURL := pm.buildDBURL(project.DBName)
+	// Provisioning uses the operator identity; all tenant traffic uses a real
+	// project login. SET ROLE on an operator connection is not an isolation boundary.
+	var owner string
+	if err := pm.platformPool.QueryRow(ctx, `SELECT u.pg_username FROM platform.pg_users u
+		JOIN platform.projects p ON p.pg_user_id = u.id WHERE p.id = $1`, projectID).Scan(&owner); err != nil {
+		return nil, fmt.Errorf("get project database owner: %w", err)
+	}
+	if err := pm.ProvisionProjectLogin(ctx, projectID, project.DBName, owner); err != nil {
+		return nil, err
+	}
+	dbURL := pm.projectURL(projectID, project.DBName)
 	poolCfg, err := pgxpool.ParseConfig(dbURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse DB URL for %s: %w", project.DBName, err)
@@ -193,7 +207,11 @@ func (pm *PoolManager) Shutdown() {
 
 func (pm *PoolManager) buildDBURL(dbName string) string {
 	u := *pm.baseURL
-	u.Path = "/" + dbName
+	u.Path, u.RawPath = "/"+dbName, ""
+	q := u.Query()
+	q.Del("dbname")
+	q.Del("database")
+	u.RawQuery = q.Encode()
 	return u.String()
 }
 

@@ -1,0 +1,43 @@
+{
+  "module": "golang.org/x/crypto",
+  "version": "v0.57.0",
+  "sourceCommit": "3f62bf119e84c6e35e8518a2958089ade622d1a3",
+  "moduleSum": "h1:3ZVCjf8Ggz7zneR/EHRVx68Ctf+2pmIMP2UFhh9cC6M=",
+  "goModSum": "h1:Fdz0i5U6CoizGwLda9DttjSk6qlZo25zYNtR+ycvuZA=",
+  "source": "https://github.com/golang/crypto/tree/v0.57.0",
+  "onlySourceModification": "bcrypt blowfish import redirected to the internal copied package",
+  "files": {
+    "LICENSE": {
+      "upstreamSha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad",
+      "localSha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"
+    },
+    "bcrypt/base64.go": {
+      "upstreamSha256": "403d60d80b8b42741d429fc5fb0bcfe961f1ca50a5adcf90b9c5b1e52bebeded",
+      "localSha256": "403d60d80b8b42741d429fc5fb0bcfe961f1ca50a5adcf90b9c5b1e52bebeded"
+    },
+    "bcrypt/bcrypt.go": {
+      "upstreamSha256": "828a8f888c646bce098a2a9461043436c87b9f5c9ca54f6a881371efa58d57d4",
+      "localSha256": "122b55f3178d066f48494a71ab3a76c2b383d8186ddb4b8ace95054cbd431d47"
+    },
+    "bcrypt/bcrypt_test.go": {
+      "upstreamSha256": "c3b6831dc1729fc4a6116a9f928893ab909fdddc92e268f35be909b6a36830c4",
+      "localSha256": "c3b6831dc1729fc4a6116a9f928893ab909fdddc92e268f35be909b6a36830c4"
+    },
+    "blowfish/block.go": {
+      "upstreamSha256": "4f7eecb319e7c3d4018c0f8528be82cd889ae7b2829ee1f9c1f83a651a883b07",
+      "localSha256": "4f7eecb319e7c3d4018c0f8528be82cd889ae7b2829ee1f9c1f83a651a883b07"
+    },
+    "blowfish/cipher.go": {
+      "upstreamSha256": "c67e62fdf539aa94cd50c1055bdc1d4c6dc93f4b2d654addfd97ccd1d12f6e48",
+      "localSha256": "c67e62fdf539aa94cd50c1055bdc1d4c6dc93f4b2d654addfd97ccd1d12f6e48"
+    },
+    "blowfish/const.go": {
+      "upstreamSha256": "fbf914c515f87da351d3b8d1ffb3751ad73a26f6817ed0857470bd44c9479c0d",
+      "localSha256": "fbf914c515f87da351d3b8d1ffb3751ad73a26f6817ed0857470bd44c9479c0d"
+    },
+    "blowfish/blowfish_test.go": {
+      "upstreamSha256": "c37f66cb2475ace6559c10c82a34c1ee0fa18ebbccc80f9a2ff4cf06ec9e4853",
+      "localSha256": "c37f66cb2475ace6559c10c82a34c1ee0fa18ebbccc80f9a2ff4cf06ec9e4853"
+    }
+  }
+}

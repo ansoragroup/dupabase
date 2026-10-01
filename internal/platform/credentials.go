@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/ansoraGROUP/dupabase/internal/cryptocompat/bcrypt"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/crypto/bcrypt"
 )
 
 type CredentialService struct {

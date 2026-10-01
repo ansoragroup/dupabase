@@ -1,5 +1,5 @@
 # Stage 1: Build Go binary
-FROM golang:1.25-alpine AS go-builder
+FROM golang:1.27.1-alpine AS go-builder
 
 WORKDIR /app
 
@@ -9,10 +9,11 @@ RUN go mod download
 
 # Build binary
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o server ./cmd/server
+ARG BUILD_REVISION=development
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X github.com/ansoraGROUP/dupabase/internal/server.BuildRevision=${BUILD_REVISION}" -o server ./cmd/server
 
 # Stage 2: Build Next.js dashboard
-FROM node:20-alpine AS next-builder
+FROM node:24-alpine AS next-builder
 
 WORKDIR /app
 
@@ -26,8 +27,12 @@ ENV NEXT_PUBLIC_API_URL=""
 RUN npm run build
 
 # Stage 3: Production
-# NOTE: Consider pinning to specific patch version (e.g., node:20.18.1-alpine3.20) for reproducible builds
-FROM node:20-alpine
+# Use the supported Node.js LTS line in both build and runtime stages.
+FROM node:24-alpine
+
+# The standalone dashboard runs with node; package managers are build-only.
+RUN rm -rf /usr/local/lib/node_modules/npm /opt/yarn-* \
+    /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/yarn /usr/local/bin/yarnpkg
 
 ARG PG_VERSION=16
 RUN apk --no-cache add ca-certificates tzdata postgresql${PG_VERSION}-client
@@ -53,7 +58,7 @@ RUN mkdir -p /tmp/imports && chown node:node /tmp/imports
 EXPOSE 3333
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD wget -qO- http://localhost:3333/health || exit 1
+  CMD wget -qO- http://127.0.0.1:3333/health || exit 1
 
 USER node
 

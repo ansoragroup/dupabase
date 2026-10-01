@@ -3,14 +3,13 @@ package platform
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/pbkdf2"
 	cryptoRand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"math/big"
 	"strings"
-
-	"golang.org/x/crypto/pbkdf2"
 )
 
 const pbkdf2Iterations = 310_000
@@ -39,7 +38,10 @@ func EncryptPgPassword(pgPassword, platformPassword string) (string, error) {
 		return "", fmt.Errorf("generate salt: %w", err)
 	}
 
-	key := pbkdf2.Key([]byte(platformPassword), salt, pbkdf2Iterations, 32, sha256.New)
+	key, err := pbkdf2.Key(sha256.New, platformPassword, salt, pbkdf2Iterations, 32)
+	if err != nil {
+		return "", fmt.Errorf("derive encryption key: %w", err)
+	}
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -95,7 +97,10 @@ func DecryptPgPassword(encryptedStr, platformPassword string) (string, error) {
 		return "", fmt.Errorf("decode ciphertext: %w", err)
 	}
 
-	key := pbkdf2.Key([]byte(platformPassword), salt, pbkdf2Iterations, 32, sha256.New)
+	key, err := pbkdf2.Key(sha256.New, platformPassword, salt, pbkdf2Iterations, 32)
+	if err != nil {
+		return "", fmt.Errorf("derive encryption key: %w", err)
+	}
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -108,6 +113,9 @@ func DecryptPgPassword(encryptedStr, platformPassword string) (string, error) {
 	}
 
 	// Reconstruct ciphertext with appended auth tag (as GCM expects)
+	if len(iv) != gcm.NonceSize() || len(authTag) != gcm.Overhead() || len(salt) != 16 {
+		return "", fmt.Errorf("invalid encrypted credential lengths")
+	}
 	ciphertextWithTag := append(encrypted, authTag...)
 	plaintext, err := gcm.Open(nil, iv, ciphertextWithTag, nil)
 	if err != nil {

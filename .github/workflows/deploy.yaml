@@ -9,45 +9,59 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  compatibility:
+    uses: ./.github/workflows/ci.yaml
+    permissions:
+      contents: read
+
+  security:
+    uses: ./.github/workflows/security.yaml
+    permissions:
+      contents: read
+      security-events: write
+
   build-and-push:
     name: Build and push image
     runs-on: [self-hosted, Linux, X64, ansoragroup-shared]
+    needs: [compatibility, security]
     permissions:
       contents: read
       packages: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set image name to lowercase
         id: meta
-        run: echo "image_name=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+        run: echo "image_name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: '1.25'
+          go-version: '1.27.1'
 
       - name: Run tests
-        run: go test ./...
+        run: go test -race ./cmd/... ./internal/...
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Login to Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
           file: .deploy/_shared/Dockerfile
           push: true
+          build-args: BUILD_REVISION=${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
           tags: |
             ${{ env.REGISTRY }}/${{ steps.meta.outputs.image_name }}:prod-latest
             ${{ env.REGISTRY }}/${{ steps.meta.outputs.image_name }}:prod-${{ github.sha }}
@@ -58,22 +72,35 @@ jobs:
     name: Deploy
     runs-on: [self-hosted, Linux, X64, ansoragroup-shared]
     needs: [build-and-push]
+    permissions:
+      contents: read
     steps:
       - name: Trigger Watchtower
+        env:
+          WATCHTOWER_ENDPOINT: ${{ secrets.WATCHTOWER_ENDPOINT }}
+          WATCHTOWER_TOKEN: ${{ secrets.WATCHTOWER_TOKEN }}
         run: |
-          curl -H "Authorization: Bearer ${{ secrets.WATCHTOWER_TOKEN }}" \
-               --location --request POST ${{ secrets.WATCHTOWER_ENDPOINT }}/v1/update
+          set -eu
+          curl --fail --silent --show-error --max-time 120 --output /dev/null \
+               -H "Authorization: Bearer ${WATCHTOWER_TOKEN}" \
+               --request POST "${WATCHTOWER_ENDPOINT%/}/v1/update"
 
       - name: Verify deployment
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+          DEPLOY_HEALTH_URL: ${{ secrets.DEPLOY_HEALTH_URL }}
         run: |
-          echo "Waiting for deployment..."
+          set -eu
+          health_url="${DEPLOY_HEALTH_URL:-https://api.dupabase.dev/health}"
+          echo "Waiting for the built revision..."
           for i in $(seq 1 12); do
-            if curl -sf https://api.dupabase.dev/health; then
-              echo "Health check passed"
+            body=$(curl --fail --silent --show-error --max-time 5 "$health_url" || true)
+            if [[ "$body" == *"\"revision\":\"${EXPECTED_REVISION}\""* ]]; then
+              echo "Health check passed for the expected revision"
               exit 0
             fi
-            echo "Attempt $i/12 failed, retrying..."
+            echo "Attempt $i/12 did not confirm the revision, retrying..."
             sleep 5
           done
-          echo "ERROR: Health check failed after 60 seconds"
+          echo "ERROR: Deployment did not become healthy at the expected revision"
           exit 1

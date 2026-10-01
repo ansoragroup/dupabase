@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useEffect, useState, useCallback, use } from "react";
 import { useAuth } from "@/lib/auth-context";
 import {
@@ -62,6 +64,9 @@ export default function TableBrowserPage({
   const [selectedTable, setSelectedTable] = useState<string | null>(null);
   const [selectedSchema, setSelectedSchema] = useState("public");
   const [columns, setColumns] = useState<ColumnInfo[]>([]);
+  const primaryColumns = columns.filter((column) => column.primary_key);
+  const identityColumn = primaryColumns.length === 1 && primaryColumns[0].unique
+    ? primaryColumns[0] : columns.find((column) => column.unique);
   const [rowsData, setRowsData] = useState<TableRowsResponse | null>(null);
   const [columnsLoading, setColumnsLoading] = useState(false);
   const [rowsLoading, setRowsLoading] = useState(false);
@@ -72,7 +77,6 @@ export default function TableBrowserPage({
 
   const loadTables = useCallback(async () => {
     if (!token) return;
-    setLoading(true);
     const { data, error } = await tablesApi.list(token, id);
     if (error) {
       toast.error(error);
@@ -82,9 +86,9 @@ export default function TableBrowserPage({
     setLoading(false);
   }, [token, id]);
 
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     loadTables();
-  }, [loadTables]);
+  }), [loadTables]);
 
   const loadColumns = useCallback(
     async (table: string, schema: string) => {
@@ -161,12 +165,14 @@ export default function TableBrowserPage({
 
   const handleDeleteRow = async (rowIdx: number) => {
     if (!token || !selectedTable || !rowsData || columns.length === 0) return;
-    const pkColumn = columns[0].name;
+    if (!identityColumn) { toast.error("This table has no supported unique row identity"); return; }
+    const pkColumn = identityColumn.name;
     const colIdx = rowsData.columns.indexOf(pkColumn);
     if (colIdx === -1) {
       toast.error("Could not determine primary key column");
       return;
     }
+    if (rowsData.rows[rowIdx][colIdx] == null) { toast.error("This row has no unique identity value"); return; }
     const pkValue = String(rowsData.rows[rowIdx][colIdx]);
     const { error } = await tablesApi.deleteRow(
       token,
@@ -191,12 +197,14 @@ export default function TableBrowserPage({
     newValue: string
   ) => {
     if (!token || !selectedTable || !rowsData || columns.length === 0) return;
-    const pkColumn = columns[0].name;
+    if (!identityColumn) { toast.error("This table has no supported unique row identity"); return; }
+    const pkColumn = identityColumn.name;
     const pkColIdx = rowsData.columns.indexOf(pkColumn);
     if (pkColIdx === -1) {
       toast.error("Could not determine primary key column");
       return;
     }
+    if (rowsData.rows[rowIdx][pkColIdx] == null) { toast.error("This row has no unique identity value"); return; }
     const pkValue = String(rowsData.rows[rowIdx][pkColIdx]);
     const colName = rowsData.columns[colIdx];
     const { error } = await tablesApi.updateRow(
@@ -477,8 +485,8 @@ export default function TableBrowserPage({
                         perPage={rowsData.per_page}
                         loading={rowsLoading}
                         onPageChange={handlePageChange}
-                        onCellEdit={handleCellEdit}
-                        onDeleteRow={handleDeleteRow}
+                        onCellEdit={identityColumn ? handleCellEdit : undefined}
+                        onDeleteRow={identityColumn ? handleDeleteRow : undefined}
                         emptyMessage="No rows found"
                       />
                     ) : rowsLoading ? (

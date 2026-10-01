@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    uses: ./.github/workflows/ci.yaml
+
+  security:
+    uses: ./.github/workflows/security.yaml
+    permissions:
+      contents: read
+      security-events: write
+
+  publish:
+    name: Publish verified release
+    needs: [compatibility, security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "$GITHUB_SHA"
+          test -f "docs/releases/${RELEASE_TAG}.md"
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'This release already exists; published versions are immutable.'
+            exit 1
+          fi
+      - name: Build candidate image
+        run: docker build --file .deploy/_shared/Dockerfile --build-arg BUILD_REVISION="$GITHUB_SHA" --label "org.opencontainers.image.revision=$GITHUB_SHA" --tag dupabase:release .
+      - name: Check exact release image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.75.0
+          image-ref: dupabase:release
+          scanners: vuln
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          ignore-unfixed: false
+          exit-code: '1'
+          format: json
+          output: image-security.json
+      - name: Generate software inventory
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.75.0
+          image-ref: dupabase:release
+          format: cyclonedx
+          output: sbom.cdx.json
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish immutable image and release evidence
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${RELEASE_TAG}"
+          docker tag dupabase:release "$image"
+          docker push "$image"
+          docker inspect "$image" --format '{{index .RepoDigests 0}}' > image-digest.txt
+          sha256sum image-security.json sbom.cdx.json image-digest.txt > SHA256SUMS
+          gh release create "$RELEASE_TAG" --verify-tag --repo "$GITHUB_REPOSITORY" \
+            --title "Dupabase ${RELEASE_TAG}" --notes-file "docs/releases/${RELEASE_TAG}.md" \
+            image-security.json sbom.cdx.json image-digest.txt SHA256SUMS

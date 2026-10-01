@@ -2,6 +2,9 @@ package platform
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,19 +16,35 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/ansoraGROUP/dupabase/internal/cryptocompat/bcrypt"
+	"github.com/ansoraGROUP/dupabase/internal/database"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // BackupService handles S3 backup operations for project databases.
 type BackupService struct {
-	db          *pgxpool.Pool
-	databaseURL string
-	backupKey   string // server-level encryption key for S3 credentials
+	db            *pgxpool.Pool
+	databaseURL   string
+	backupKey     string // server-level encryption key for S3 credentials
+	poolManager   *database.PoolManager
+	importService *ImportService
+}
+
+func (s *BackupService) SetProjectServices(pm *database.PoolManager, imports *ImportService) {
+	s.poolManager, s.importService = pm, imports
+}
+
+func (s *BackupService) projectDBURL(ctx context.Context, dbName string) (string, error) {
+	if s.poolManager == nil {
+		return "", fmt.Errorf("project credential provider is not configured")
+	}
+	return s.poolManager.ProjectDatabaseURL(ctx, dbName)
 }
 
 // NewBackupService creates a new BackupService.
@@ -109,6 +128,9 @@ func (s *BackupService) SaveSettings(ctx context.Context, userID, orgID string, 
 	if req.S3Endpoint == "" {
 		return nil, http.StatusBadRequest, fmt.Errorf("s3_endpoint is required")
 	}
+	if _, err := endpointOrigin(req.S3Endpoint); err != nil {
+		return nil, http.StatusBadRequest, err
+	}
 	if req.S3Bucket == "" {
 		return nil, http.StatusBadRequest, fmt.Errorf("s3_bucket is required")
 	}
@@ -134,6 +156,7 @@ func (s *BackupService) SaveSettings(ctx context.Context, userID, orgID string, 
 	if region == "" {
 		region = "us-east-1"
 	}
+
 	schedule := req.Schedule
 	if schedule == "" {
 		schedule = "daily"
@@ -162,34 +185,45 @@ func (s *BackupService) SaveSettings(ctx context.Context, userID, orgID string, 
 		projectIDs = []string{}
 	}
 
-	// UPSERT keyed on org_id (with fallback to user_id for backward compat)
+	// Lock the organization, rather than a user's row: one administrator can
+	// manage several organizations without overwriting their other settings.
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("begin settings save: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	var lockedOrg string
+	if err = tx.QueryRow(ctx, `SELECT id FROM platform.organizations WHERE id=$1 FOR UPDATE`, orgID).Scan(&lockedOrg); err != nil {
+		return nil, http.StatusNotFound, fmt.Errorf("organization not found")
+	}
 	var id string
-	err = s.db.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `SELECT id FROM platform.backup_settings WHERE org_id=$1 ORDER BY updated_at DESC, id DESC LIMIT 1`, orgID).Scan(&id)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, http.StatusInternalServerError, fmt.Errorf("find settings: %w", err)
+	}
+	query := `
 		INSERT INTO platform.backup_settings (
 			user_id, org_id, s3_endpoint, s3_region, s3_bucket,
 			s3_access_key_encrypted, s3_secret_key_encrypted,
 			s3_path_prefix, schedule, retention_days, project_ids, enabled
 		) VALUES ($1, $11, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)
-		ON CONFLICT (user_id) DO UPDATE SET
-			org_id = EXCLUDED.org_id,
-			s3_endpoint = EXCLUDED.s3_endpoint,
-			s3_region = EXCLUDED.s3_region,
-			s3_bucket = EXCLUDED.s3_bucket,
-			s3_access_key_encrypted = EXCLUDED.s3_access_key_encrypted,
-			s3_secret_key_encrypted = EXCLUDED.s3_secret_key_encrypted,
-			s3_path_prefix = EXCLUDED.s3_path_prefix,
-			schedule = EXCLUDED.schedule,
-			retention_days = EXCLUDED.retention_days,
-			project_ids = EXCLUDED.project_ids,
-			enabled = TRUE,
-			updated_at = NOW()
 		RETURNING id
-	`, userID, req.S3Endpoint, region, req.S3Bucket,
+	`
+	args := []any{userID, req.S3Endpoint, region, req.S3Bucket,
 		accessKeyEnc, secretKeyEnc,
-		req.S3PathPrefix, schedule, retentionDays, projectIDs, orgID,
-	).Scan(&id)
+		req.S3PathPrefix, schedule, retentionDays, projectIDs, orgID}
+	if err == nil {
+		query = `UPDATE platform.backup_settings SET user_id=$1, s3_endpoint=$2, s3_region=$3, s3_bucket=$4,
+			s3_access_key_encrypted=$5, s3_secret_key_encrypted=$6, s3_path_prefix=$7, schedule=$8,
+			retention_days=$9, project_ids=$10, org_id=$11, enabled=TRUE, updated_at=NOW() WHERE id=$12 RETURNING id`
+		args = append(args, id)
+	}
+	err = tx.QueryRow(ctx, query, args...).Scan(&id)
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("upsert backup settings: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("commit settings save: %w", err)
 	}
 
 	return &BackupSettingsResponse{
@@ -213,6 +247,7 @@ func (s *BackupService) GetSettings(ctx context.Context, orgID string) (*BackupS
 			schedule, retention_days, project_ids, enabled
 		FROM platform.backup_settings
 		WHERE org_id = $1
+		ORDER BY updated_at DESC, id DESC LIMIT 1
 	`, orgID).Scan(
 		&resp.ID, &resp.S3Endpoint, &resp.S3Region, &resp.S3Bucket,
 		&resp.S3PathPrefix, &resp.Schedule, &resp.RetentionDays, &resp.ProjectIDs, &resp.Enabled,
@@ -290,6 +325,8 @@ func (s *BackupService) RunBackupsForAllUsers(ctx context.Context) error {
 			s3_path_prefix, schedule, retention_days, project_ids, enabled
 		FROM platform.backup_settings
 		WHERE enabled = TRUE
+		AND id IN (SELECT DISTINCT ON (COALESCE(org_id::text, 'user:' || user_id::text)) id
+		  FROM platform.backup_settings ORDER BY COALESCE(org_id::text, 'user:' || user_id::text), updated_at DESC, id DESC)
 	`)
 	if err != nil {
 		return fmt.Errorf("query backup settings: %w", err)
@@ -380,8 +417,16 @@ func (s *BackupService) TestS3Connection(ctx context.Context, req TestS3Connecti
 		region = "us-east-1"
 	}
 
+	httpClient, err := storageHTTPClient(req.S3Endpoint)
+	if err != nil {
+		return http.StatusBadRequest, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
 	cfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(region),
+		awsconfig.WithHTTPClient(httpClient),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(req.S3AccessKey, req.S3SecretKey, "")),
 	)
 	if err != nil {
@@ -427,7 +472,7 @@ func (s *BackupService) ToggleEnabled(ctx context.Context, userID, orgID string,
 	err = s.db.QueryRow(ctx, `
 		UPDATE platform.backup_settings
 		SET enabled = $1, updated_at = NOW()
-		WHERE org_id = $2
+		WHERE id = (SELECT id FROM platform.backup_settings WHERE org_id=$2 ORDER BY updated_at DESC, id DESC LIMIT 1)
 		RETURNING id, s3_endpoint, s3_region, s3_bucket, s3_path_prefix,
 			schedule, retention_days, project_ids, enabled
 	`, req.Enabled, orgID).Scan(
@@ -493,6 +538,7 @@ func buildExportArgs(host, port, user, dbName string, opts ExportOptions) []stri
 
 	args := []string{
 		"--format=" + pgFormat,
+		"--exclude-schema=platform",
 		"--no-owner",
 		"--no-acl",
 		"--host=" + host, "--port=" + port, "--username=" + user, "--dbname=" + dbName,
@@ -574,12 +620,13 @@ func (s *BackupService) RestoreBackup(ctx context.Context, userID string, histor
 	}
 
 	// Look up backup history record
-	var projectID, dbName, s3Key, status string
+	var projectID, dbName, s3Key, status, expectedHash, sourceEndpoint, sourceRegion, sourceBucket string
 	err = s.db.QueryRow(ctx, `
-		SELECT project_id, db_name, s3_key, status
+		SELECT project_id, db_name, s3_key, status, COALESCE(content_sha256,''),
+			COALESCE(source_endpoint,''), COALESCE(source_region,''), COALESCE(source_bucket,'')
 		FROM platform.backup_history
 		WHERE id = $1
-	`, historyID).Scan(&projectID, &dbName, &s3Key, &status)
+	`, historyID).Scan(&projectID, &dbName, &s3Key, &status, &expectedHash, &sourceEndpoint, &sourceRegion, &sourceBucket)
 	if err != nil {
 		return 0, http.StatusNotFound, fmt.Errorf("backup history record not found")
 	}
@@ -587,24 +634,34 @@ func (s *BackupService) RestoreBackup(ctx context.Context, userID string, histor
 		return 0, http.StatusBadRequest, fmt.Errorf("can only restore completed backups (status: %s)", status)
 	}
 
-	// Get S3 settings (need the user who owns this backup history to get credentials)
-	var backupUserID string
-	err = s.db.QueryRow(ctx, `SELECT user_id FROM platform.backup_history WHERE id = $1`, historyID).Scan(&backupUserID)
+	// The invoking user's mutable personal settings are not backup provenance.
+	var orgID string
+	err = s.db.QueryRow(ctx, `SELECT org_id FROM platform.projects WHERE id = $1 AND db_name = $2 AND status = 'active'`, projectID, dbName).Scan(&orgID)
 	if err != nil {
-		return 0, http.StatusInternalServerError, fmt.Errorf("lookup backup user: %w", err)
+		return 0, http.StatusNotFound, fmt.Errorf("backup project is not active")
 	}
-	settings, err := s.getSettingsInternal(ctx, backupUserID)
+	settings, err := s.getSettingsInternalByOrg(ctx, orgID)
 	if err != nil {
 		return 0, http.StatusNotFound, fmt.Errorf("backup settings not found for restore")
 	}
+	// New backups bind their original destination and content. Credentials still
+	// come from the current organization's administrator-controlled settings.
+	if sourceEndpoint != "" {
+		settings.S3Endpoint, settings.S3Region, settings.S3Bucket = sourceEndpoint, sourceRegion, sourceBucket
+	}
 
 	// Build target database URL
-	u, err := url.Parse(s.databaseURL)
+	dbURL, err := s.projectDBURL(ctx, dbName)
 	if err != nil {
 		return 0, http.StatusInternalServerError, fmt.Errorf("parse database URL: %w", err)
 	}
-	u.Path = "/" + dbName
-	dbURL := u.String()
+	if s.importService == nil {
+		return 0, http.StatusInternalServerError, fmt.Errorf("restore worker is not configured")
+	}
+	release, err := s.importService.reserveJob(projectID)
+	if err != nil {
+		return 0, http.StatusTooManyRequests, err
+	}
 
 	// Create import task record for tracking
 	var taskID int64
@@ -614,19 +671,32 @@ func (s *BackupService) RestoreBackup(ctx context.Context, userID string, histor
 		RETURNING id
 	`, userID, projectID, dbName, "restore:"+s3Key).Scan(&taskID)
 	if err != nil {
+		release()
 		return 0, http.StatusInternalServerError, fmt.Errorf("create import task: %w", err)
 	}
 
 	// Launch restore in background
-	go s.executeRestore(taskID, dbURL, s3Key, settings)
+	go func() { defer release(); s.executeRestore(taskID, dbURL, s3Key, settings, expectedHash) }()
 
 	return taskID, http.StatusAccepted, nil
 }
 
 // executeRestore downloads a backup from S3 to a temp file and runs pg_restore.
-func (s *BackupService) executeRestore(taskID int64, dbURL, s3Key string, settings *backupSettingsInternal) {
+func (s *BackupService) executeRestore(taskID int64, dbURL, s3Key string, settings *backupSettingsInternal, expectedHash string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()
+	s.importService.mu.Lock()
+	s.importService.cancels[taskID] = cancel
+	s.importService.mu.Unlock()
+	defer func() {
+		s.importService.mu.Lock()
+		delete(s.importService.cancels, taskID)
+		s.importService.mu.Unlock()
+	}()
+	var taskStatus string
+	if err := s.db.QueryRow(ctx, `SELECT status FROM platform.import_tasks WHERE id=$1`, taskID).Scan(&taskStatus); err != nil || taskStatus != "running" {
+		return
+	}
 
 	// Download from S3
 	client, err := s.getS3Client(ctx, settings)
@@ -657,21 +727,33 @@ func (s *BackupService) executeRestore(taskID int64, dbURL, s3Key string, settin
 	}
 	defer os.Remove(tmpFile.Name())
 
-	if _, err := io.Copy(tmpFile, output.Body); err != nil {
+	maxBytes := int64(s.poolManager.Config().ImportMaxSizeMB) * 1024 * 1024
+	if maxBytes <= 0 {
+		maxBytes = 500 * 1024 * 1024
+	}
+	digest := sha256.New()
+	written, err := io.Copy(io.MultiWriter(tmpFile, digest), io.LimitReader(output.Body, maxBytes+1))
+	if err != nil || written > maxBytes {
 		tmpFile.Close()
-		s.markRestoreFailed(ctx, taskID, fmt.Sprintf("download backup: %v", err))
+		s.markRestoreFailed(ctx, taskID, "backup exceeds the restore size limit or could not be downloaded")
 		return
 	}
 	tmpFile.Close()
+	if expectedHash != "" && hex.EncodeToString(digest.Sum(nil)) != expectedHash {
+		s.markRestoreFailed(ctx, taskID, "backup content does not match its recorded SHA-256 digest")
+		return
+	}
 
 	// Run pg_restore
-	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	host, port, user, _, dbName, err := splitDBURL(dbURL)
 	if err != nil {
 		s.markRestoreFailed(ctx, taskID, fmt.Sprintf("parse DB URL: %v", err))
 		return
 	}
 
 	cmd := exec.CommandContext(ctx, "pg_restore",
+		"--exit-on-error",
+		"--exclude-schema=platform",
 		"--no-owner",
 		"--no-acl",
 		"--clean",
@@ -679,17 +761,14 @@ func (s *BackupService) executeRestore(taskID int64, dbURL, s3Key string, settin
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		tmpFile.Name(),
 	)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+	cmd.Env = pgCommandEnv(dbURL)
 
-	out, err := cmd.CombinedOutput()
+	out, err := runBoundedCommand(cmd)
 	if err != nil {
 		outStr := string(out)
-		if isOnlyWarnings(outStr) {
-			slog.Warn("pg_restore (restore) completed with warnings", "task_id", taskID, "output", outStr)
-		} else {
-			s.markRestoreFailed(ctx, taskID, fmt.Sprintf("pg_restore: %s", outStr))
-			return
-		}
+		s.markRestoreFailed(ctx, taskID, fmt.Sprintf("pg_restore: %s", outStr))
+		return
+
 	}
 
 	tableCount := countRestoredTables(ctx, dbURL)
@@ -697,7 +776,7 @@ func (s *BackupService) executeRestore(taskID int64, dbURL, s3Key string, settin
 	if _, err := s.db.Exec(ctx, `
 		UPDATE platform.import_tasks
 		SET status = 'completed', tables_imported = $1, completed_at = NOW()
-		WHERE id = $2
+		WHERE id = $2 AND status = 'running'
 	`, tableCount, taskID); err != nil {
 		slog.Error("failed to mark restore as completed", "task_id", taskID, "error", err)
 	}
@@ -707,10 +786,12 @@ func (s *BackupService) executeRestore(taskID int64, dbURL, s3Key string, settin
 
 func (s *BackupService) markRestoreFailed(ctx context.Context, taskID int64, errMsg string) {
 	slog.Error("Restore failed", "task_id", taskID, "error", errMsg)
-	if _, err := s.db.Exec(ctx, `
+	updateCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := s.db.Exec(updateCtx, `
 		UPDATE platform.import_tasks
 		SET status = 'failed', error_message = $1, completed_at = NOW()
-		WHERE id = $2
+		WHERE id = $2 AND status = 'running'
 	`, errMsg, taskID); err != nil {
 		slog.Error("failed to mark restore as failed", "task_id", taskID, "error", err)
 	}
@@ -751,6 +832,7 @@ func (s *BackupService) getSettingsInternalByOrg(ctx context.Context, orgID stri
 			s3_path_prefix, schedule, retention_days, project_ids, enabled
 		FROM platform.backup_settings
 		WHERE org_id = $1
+		ORDER BY updated_at DESC, id DESC LIMIT 1
 	`, orgID).Scan(&bs.ID, &bs.UserID, &bs.OrgID, &bs.S3Endpoint, &bs.S3Region,
 		&bs.S3Bucket, &bs.S3AccessKeyEncrypted, &bs.S3SecretKeyEncrypted,
 		&bs.S3PathPrefix, &bs.Schedule, &bs.RetentionDays, &bs.ProjectIDs, &bs.Enabled)
@@ -852,6 +934,18 @@ func (s *BackupService) isDue(ctx context.Context, schedule, projectID string, n
 
 // runSingleBackup performs pg_dump and uploads the result to S3 for one project.
 func (s *BackupService) runSingleBackup(ctx context.Context, userID, projectID, dbName string, settings *backupSettingsInternal) {
+	if s.importService == nil {
+		slog.Error("backup worker is not configured")
+		return
+	}
+	release, err := s.importService.reserveJob(projectID)
+	if err != nil {
+		slog.Warn("backup workers are busy", "project_id", projectID)
+		return
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Minute)
+	defer cancel()
 	now := time.Now().UTC()
 	shortID := projectID
 	if len(shortID) > 8 {
@@ -860,13 +954,13 @@ func (s *BackupService) runSingleBackup(ctx context.Context, userID, projectID, 
 	s3Key := fmt.Sprintf("%s%s/%s_%s.dump",
 		settings.S3PathPrefix,
 		dbName,
-		now.Format("2006-01-02T15-04-05Z"),
+		now.Format("2006-01-02T15-04-05.000000000Z"),
 		shortID,
 	)
 
 	// Insert running record
 	var historyID int64
-	err := s.db.QueryRow(ctx, `
+	err = s.db.QueryRow(ctx, `
 		INSERT INTO platform.backup_history (user_id, project_id, db_name, s3_key, status)
 		VALUES ($1, $2, $3, $4, 'running')
 		RETURNING id
@@ -889,7 +983,12 @@ func (s *BackupService) runSingleBackup(ctx context.Context, userID, projectID, 
 	defer reader.Close()
 
 	// Upload to S3
-	sizeBytes, err := s.uploadToS3(ctx, settings, s3Key, reader)
+	digest := sha256.New()
+	sizeBytes, err := s.uploadToS3(ctx, settings, s3Key, io.TeeReader(reader, digest))
+	dumpErr := reader.Close()
+	if err == nil {
+		err = dumpErr
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			// Try to clean up partial upload with a fresh context
@@ -904,9 +1003,10 @@ func (s *BackupService) runSingleBackup(ctx context.Context, userID, projectID, 
 	// Mark completed
 	if _, err := s.db.Exec(ctx, `
 		UPDATE platform.backup_history
-		SET status = 'completed', size_bytes = $1, completed_at = NOW()
+		SET status = 'completed', size_bytes = $1, completed_at = NOW(), content_sha256=$3,
+			source_endpoint=$4, source_region=$5, source_bucket=$6
 		WHERE id = $2
-	`, sizeBytes, historyID); err != nil {
+	`, sizeBytes, historyID, hex.EncodeToString(digest.Sum(nil)), settings.S3Endpoint, settings.S3Region, settings.S3Bucket); err != nil {
 		slog.Error("failed to update backup history", "error", err)
 	}
 
@@ -956,11 +1056,14 @@ func (s *BackupService) deleteS3Object(ctx context.Context, settings *backupSett
 
 // dumpDatabase runs pg_dump for a specific database and returns a reader of the output.
 func (s *BackupService) dumpDatabase(ctx context.Context, dbName string, opts ExportOptions) (io.ReadCloser, error) {
-	u, err := url.Parse(s.databaseURL)
+	dbURL, err := s.projectDBURL(ctx, dbName)
 	if err != nil {
 		return nil, fmt.Errorf("parse database URL: %w", err)
 	}
-	u.Path = "/" + dbName
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		return nil, err
+	}
 
 	host := u.Hostname()
 	port := u.Port()
@@ -968,12 +1071,12 @@ func (s *BackupService) dumpDatabase(ctx context.Context, dbName string, opts Ex
 		port = "5432"
 	}
 	user := u.User.Username()
-	password, _ := u.User.Password()
 
 	args := buildExportArgs(host, port, user, dbName, opts)
+	args = append(args, "--exclude-schema=platform")
 
 	cmd := exec.CommandContext(ctx, "pg_dump", args...)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+	cmd.Env = pgCommandEnv(dbURL)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -990,15 +1093,43 @@ func (s *BackupService) dumpDatabase(ctx context.Context, dbName string, opts Ex
 type dumpReader struct {
 	cmd *exec.Cmd
 	io.ReadCloser
+	closed   bool
+	closeErr error
+}
+
+// A failed pg_dump must also fail consumers which only read the stream. Waiting
+// at EOF exposes command failures before an empty export can be reported as OK.
+func (r *dumpReader) Read(p []byte) (int, error) {
+	if r.closed {
+		if r.closeErr != nil {
+			return 0, r.closeErr
+		}
+		return 0, io.EOF
+	}
+	n, err := r.ReadCloser.Read(p)
+	if err == io.EOF {
+		r.closeErr = r.cmd.Wait()
+		r.closed = true
+		if r.closeErr != nil {
+			return n, r.closeErr
+		}
+	}
+	return n, err
 }
 
 func (r *dumpReader) Close() error {
+	if r.closed {
+		return r.closeErr
+	}
+	r.closed = true
 	err := r.ReadCloser.Close()
 	cmdErr := r.cmd.Wait()
 	if err != nil {
-		return err
+		r.closeErr = err
+	} else {
+		r.closeErr = cmdErr
 	}
-	return cmdErr
+	return r.closeErr
 }
 
 // uploadToS3 decrypts S3 credentials and uploads the dump to S3.
@@ -1008,15 +1139,21 @@ func (s *BackupService) uploadToS3(ctx context.Context, settings *backupSettings
 		return 0, fmt.Errorf("create S3 client: %w", err)
 	}
 
-	// We need to buffer to know the size; use a countingReader to track bytes.
+	// The uploader buffers bounded parts for an unseekable pg_dump stream.
+	// Shared job admission caps total workers; each upload uses at most two parts.
 	cr := &countingReader{r: body}
-	_, err = client.PutObject(ctx, &s3.PutObjectInput{
+	uploader := transfermanager.New(client, func(u *transfermanager.Options) {
+		u.PartSizeBytes = 5 * 1024 * 1024
+		u.Concurrency = 2
+		u.FailTimeout = 15 * time.Second
+	})
+	_, err = uploader.UploadObject(ctx, &transfermanager.UploadObjectInput{
 		Bucket: aws.String(settings.S3Bucket),
 		Key:    aws.String(key),
 		Body:   cr,
 	})
 	if err != nil {
-		return 0, fmt.Errorf("PutObject: %w", err)
+		return 0, fmt.Errorf("S3 upload: %w", err)
 	}
 
 	return cr.n, nil
@@ -1036,6 +1173,10 @@ func (cr *countingReader) Read(p []byte) (int, error) {
 
 // getS3Client creates an S3 client from backup settings.
 func (s *BackupService) getS3Client(ctx context.Context, settings *backupSettingsInternal) (*s3.Client, error) {
+	httpClient, err := storageHTTPClient(settings.S3Endpoint)
+	if err != nil {
+		return nil, err
+	}
 	accessKey, err := DecryptPgPassword(settings.S3AccessKeyEncrypted, s.backupKey)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt access key: %w", err)
@@ -1047,6 +1188,7 @@ func (s *BackupService) getS3Client(ctx context.Context, settings *backupSetting
 
 	cfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(settings.S3Region),
+		awsconfig.WithHTTPClient(httpClient),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
 	)
 	if err != nil {

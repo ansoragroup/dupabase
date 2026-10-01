@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth-context";
@@ -9,7 +11,6 @@ import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -78,9 +79,9 @@ export default function ProjectsPage() {
     setLoading(false);
   }, [token, activeOrg?.id]);
 
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     load();
-  }, [load]);
+  }), [load]);
 
   const handleCreate = async () => {
     if (!token || !newName.trim()) return;

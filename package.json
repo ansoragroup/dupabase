@@ -7,13 +7,15 @@
     "test": "tests"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "go test ./cmd/... ./internal/...",
+    "test:compat": "node tests/test_supabase_client.mjs",
+    "test:security": "node tests/security_regression.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "MIT",
   "type": "commonjs",
   "dependencies": {
-    "@supabase/supabase-js": "^2.95.3"
+    "@supabase/supabase-js": "^2.117.2"
   }
 }

@@ -102,6 +102,9 @@ func Load() (*Config, error) {
 	if cfg.GlobalMaxConnections < 1 {
 		return nil, fmt.Errorf("GLOBAL_MAX_CONNECTIONS must be >= 1, got %d", cfg.GlobalMaxConnections)
 	}
+	if cfg.DefaultPasswordMinLength < 6 || cfg.DefaultPasswordMinLength > 72 {
+		return nil, fmt.Errorf("DEFAULT_PASSWORD_MIN_LENGTH must be between 6 and 72")
+	}
 
 	// Validate backup encryption key length
 	if cfg.BackupEncryptionKey != "" && len(cfg.BackupEncryptionKey) < 32 {

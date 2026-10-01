@@ -13,9 +13,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ansoraGROUP/dupabase/internal/cryptocompat/bcrypt"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // pgUsernameRegex validates generated PG usernames (u_ + 12 hex chars)
@@ -148,18 +149,23 @@ func (s *AuthService) Register(ctx context.Context, req RegisterRequest) (*AuthR
 		}
 		var id string
 		var usedBy *string
+		var usedAt *time.Time
+		var targetEmail *string
 		var expiresAt time.Time
 		err := s.db.QueryRow(ctx, `
-			SELECT id, used_by, expires_at FROM platform.invites WHERE code = $1
-		`, req.InviteCode).Scan(&id, &usedBy, &expiresAt)
+			SELECT id, used_by, used_at, expires_at, email FROM platform.invites WHERE code = $1
+		`, req.InviteCode).Scan(&id, &usedBy, &usedAt, &expiresAt, &targetEmail)
 		if err != nil {
 			return nil, http.StatusBadRequest, fmt.Errorf("invalid invite code")
 		}
-		if usedBy != nil {
+		if usedBy != nil || usedAt != nil {
 			return nil, http.StatusBadRequest, fmt.Errorf("invite code already used")
 		}
 		if time.Now().After(expiresAt) {
 			return nil, http.StatusBadRequest, fmt.Errorf("invite code expired")
+		}
+		if targetEmail != nil && strings.ToLower(strings.TrimSpace(*targetEmail)) != email {
+			return nil, http.StatusBadRequest, fmt.Errorf("invite code is for another email")
 		}
 		inviteID = &id
 	}
@@ -258,11 +264,17 @@ func (s *AuthService) Register(ctx context.Context, req RegisterRequest) (*AuthR
 
 	// Mark invite as used if applicable
 	if inviteID != nil {
-		_, err = tx.Exec(ctx, `
-			UPDATE platform.invites SET used_by = $1, used_at = NOW() WHERE id = $2
-		`, userID, *inviteID)
+		tag, consumeErr := tx.Exec(ctx, `
+			UPDATE platform.invites SET used_by = $1, used_at = NOW()
+			WHERE id = $2 AND used_by IS NULL AND used_at IS NULL AND expires_at > NOW()
+			AND (email IS NULL OR lower(trim(email)) = $3)
+		`, userID, *inviteID, email)
+		err = consumeErr
 		if err != nil {
 			return nil, http.StatusInternalServerError, fmt.Errorf("mark invite used: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return nil, http.StatusBadRequest, fmt.Errorf("invite code is no longer valid")
 		}
 	}
 
@@ -425,11 +437,21 @@ func (s *AuthService) EnsureAdmin(ctx context.Context, email, password string) e
 
 	// Check if already exists
 	var existingID string
-	err := s.db.QueryRow(ctx, `SELECT id FROM platform.users WHERE email = $1`, email).Scan(&existingID)
+	var existingAdmin bool
+	var existingHash string
+	err := s.db.QueryRow(ctx, `SELECT id, is_admin, password_hash FROM platform.users WHERE email = $1`, email).Scan(&existingID, &existingAdmin, &existingHash)
 	if err == nil {
-		// User exists, ensure is_admin = true
+		if existingAdmin {
+			return nil
+		}
+		if bcrypt.CompareHashAndPassword([]byte(existingHash), []byte(password)) != nil {
+			return fmt.Errorf("admin bootstrap refused: existing account password does not match configured admin password")
+		}
 		_, err = s.db.Exec(ctx, `UPDATE platform.users SET is_admin = TRUE WHERE id = $1`, existingID)
 		return err
+	}
+	if err != pgx.ErrNoRows {
+		return fmt.Errorf("lookup admin account: %w", err)
 	}
 
 	// Create admin user via normal Register flow

@@ -32,6 +32,9 @@ docker-compose*.yaml
 .env.production
 .env.local
 .env.*.local
+**/.env
+**/.env.*
+!**/.env.example
 
 # Misc
 tmp/

@@ -1,0 +1,63 @@
+name: Compatibility
+
+on:
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: PostgreSQL ${{ matrix.postgres }} compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['14', '15', '16', '17', '18']
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_DB: dupabase_maintenance_ci
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: isolated-ci-fixture-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            dashboard/package-lock.json
+      - name: Backend checks
+        env:
+          DUPABASE_TEST_DATABASE_URL: postgresql://postgres:isolated-ci-fixture-password@127.0.0.1:5432/dupabase_maintenance_ci?sslmode=disable
+        run: |
+          go mod verify
+          go vet ./cmd/... ./internal/...
+          go test -race -count=1 ./cmd/... ./internal/...
+      - name: Install dashboard dependencies
+        run: |
+          npm ci --ignore-scripts
+          npm ci --ignore-scripts --prefix dashboard
+      - name: Dashboard checks
+        working-directory: dashboard
+        run: |
+          npm run lint
+          npx --no-install tsc --noEmit
+          npm run test:run
+          npm run build

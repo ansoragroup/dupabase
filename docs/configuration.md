@@ -49,7 +49,7 @@ These apply when creating new projects. Each project can override them in the da
 |----------|---------|-------------|
 | `DEFAULT_ENABLE_SIGNUP` | `true` | Allow public signups |
 | `DEFAULT_AUTOCONFIRM` | `true` | Auto-confirm new users (no email verification) |
-| `DEFAULT_PASSWORD_MIN_LENGTH` | `6` | Minimum password length |
+| `DEFAULT_PASSWORD_MIN_LENGTH` | `6` | Minimum password length, from 6 to 72 |
 
 ### Security
 
@@ -57,6 +57,14 @@ These apply when creating new projects. Each project can override them in the da
 |----------|---------|-------------|
 | `BACKUP_ENCRYPTION_KEY` | Falls back to `PLATFORM_JWT_SECRET` | AES-256-GCM key for encrypting S3 backup credentials at rest |
 | `ALLOWED_ORIGINS` | `localhost:3000,3001,3333` | CORS allowed origins (comma-separated) |
+| `TRUST_PROXY` | `false` | Accept forwarded client addresses only from configured trusted peers |
+| `TRUSTED_PROXY_CIDRS` | `127.0.0.0/8,::1/128` | Comma-separated proxy networks; set your actual proxy addresses before enabling proxy trust |
+| `BACKUP_ALLOWED_ENDPOINTS` | Empty | Exact comma-separated HTTP(S) origins approved for private/internal S3-compatible storage, such as `http://minio:9000` |
+| `REST_MAX_RESPONSE_BYTES` | `33554432` | Maximum encoded REST result size; oversized results return an error asking for a smaller page |
+
+Private S3 endpoints require an operator-approved origin. Public endpoints must resolve to public addresses; redirects are blocked. PostgreSQL command-line workers preserve connection TLS options from `DATABASE_URL`, including verification/certificate settings.
+
+When auto-confirmation is disabled, unconfirmed users receive no session and cannot log in until confirmed. Email delivery/verification workflows must be supplied separately; this maintenance does not add an SMTP provider. Plain SQL import requires PostgreSQL client 16.10 or newer for restricted mode; the container supplies an updated PostgreSQL 16 client.
 
 ### Import
 

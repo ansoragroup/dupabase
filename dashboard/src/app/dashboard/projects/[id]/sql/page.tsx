@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useState, useCallback, useEffect, useRef, use } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { sql as sqlApi, type SQLResponse } from "@/lib/api";
@@ -43,7 +45,7 @@ import {
 import Link from "next/link";
 import Editor, { type OnMount } from "@monaco-editor/react";
 
-const HISTORY_KEY = "dupabase_sql_history";
+const HISTORY_PREFIX = "dupabase_sql_history:";
 const MAX_HISTORY = 30;
 
 interface HistoryEntry {
@@ -51,9 +53,9 @@ interface HistoryEntry {
   timestamp: number;
 }
 
-function loadHistory(): HistoryEntry[] {
+function loadHistory(key: string): HistoryEntry[] {
   try {
-    const raw = localStorage.getItem(HISTORY_KEY);
+    const raw = sessionStorage.getItem(key);
     if (!raw) return [];
     return JSON.parse(raw) as HistoryEntry[];
   } catch {
@@ -61,8 +63,8 @@ function loadHistory(): HistoryEntry[] {
   }
 }
 
-function saveHistory(entries: HistoryEntry[]) {
-  localStorage.setItem(HISTORY_KEY, JSON.stringify(entries.slice(0, MAX_HISTORY)));
+function saveHistory(key: string, entries: HistoryEntry[]) {
+  sessionStorage.setItem(key, JSON.stringify(entries.slice(0, MAX_HISTORY)));
 }
 
 export default function SQLEditorPage({
@@ -71,7 +73,8 @@ export default function SQLEditorPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = use(params);
-  const { token } = useAuth();
+  const { token, user } = useAuth();
+  const historyKey = user ? `${HISTORY_PREFIX}${user.id}:${id}` : "";
   const [query, setQuery] = useState("SELECT 1;");
   const [readOnly, setReadOnly] = useState(false);
   const [executing, setExecuting] = useState(false);
@@ -80,9 +83,10 @@ export default function SQLEditorPage({
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const executeRef = useRef<() => void>(undefined);
 
-  useEffect(() => {
-    setHistory(loadHistory());
-  }, []);
+  useEffect(() => deferEffect(() => {
+    localStorage.removeItem("dupabase_sql_history");
+    setHistory(historyKey ? loadHistory(historyKey) : []);
+  }), [historyKey]);
 
   const execute = useCallback(async () => {
     if (!token || !query.trim()) return;
@@ -114,10 +118,10 @@ export default function SQLEditorPage({
       MAX_HISTORY
     );
     setHistory(updated);
-    saveHistory(updated);
+    saveHistory(historyKey, updated);
 
     setExecuting(false);
-  }, [token, id, query, readOnly, history]);
+  }, [token, id, query, readOnly, history, historyKey]);
 
   // Keep executeRef in sync so the Monaco keybinding always calls the latest execute
   useEffect(() => {
@@ -136,7 +140,7 @@ export default function SQLEditorPage({
 
   const clearHistory = () => {
     setHistory([]);
-    localStorage.removeItem(HISTORY_KEY);
+    sessionStorage.removeItem(historyKey);
     toast.success("History cleared");
   };
 

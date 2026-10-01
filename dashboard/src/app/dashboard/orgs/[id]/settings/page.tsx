@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useState, useEffect, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth-context";
@@ -56,9 +58,9 @@ export default function OrgSettingsPage() {
     setLoading(false);
   }, [token, id]);
 
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     loadOrg();
-  }, [loadOrg]);
+  }), [loadOrg]);
 
   const handleSave = async () => {
     if (!token || !id || !name.trim() || !slug.trim()) return;

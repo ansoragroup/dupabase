@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useEffect, useState, useCallback, use } from "react";
 import { useAuth } from "@/lib/auth-context";
 import {
@@ -12,9 +14,6 @@ import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -57,7 +56,6 @@ import {
   ShieldBan,
   ShieldCheck,
   Trash2,
-  UserX,
   Ghost,
   Monitor,
 } from "lucide-react";
@@ -122,9 +120,9 @@ export default function AuthUsersPage({
     setLoading(false);
   }, [token, id, page, perPage, search]);
 
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     loadUsers();
-  }, [loadUsers]);
+  }), [loadUsers]);
 
   const handleSearch = () => {
     setSearch(searchInput);

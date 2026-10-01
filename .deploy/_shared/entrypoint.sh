@@ -3,13 +3,14 @@ set -e
 
 # Start Next.js dashboard in the background (port 3000 internal)
 cd /app/dashboard
-HOSTNAME=0.0.0.0 PORT=3000 node server.js &
+# The dashboard does not need the Go server's database or signing credentials.
+env -i PATH="$PATH" HOME="$HOME" NODE_ENV=production HOSTNAME=127.0.0.1 PORT=3000 node server.js &
 NEXT_PID=$!
 
 # Wait for Next.js to be ready
 echo "Waiting for Next.js to start..."
 for i in $(seq 1 30); do
-  if wget -q --spider http://localhost:3000 2>/dev/null; then
+  if wget -q --spider http://127.0.0.1:3000 2>/dev/null; then
     echo "Next.js is ready"
     break
   fi
@@ -21,7 +22,7 @@ done
 
 # Start Go server (port 3333, proxies non-API routes to Next.js)
 cd /app
-export DASHBOARD_URL="http://localhost:3000"
+export DASHBOARD_URL="http://127.0.0.1:3000"
 ./server &
 GO_PID=$!
 

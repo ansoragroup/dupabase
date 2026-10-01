@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -14,12 +15,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ansoraGROUP/dupabase/internal/cryptocompat/bcrypt"
 	"github.com/ansoraGROUP/dupabase/internal/database"
 	"github.com/ansoraGROUP/dupabase/internal/httputil"
 	"github.com/ansoraGROUP/dupabase/internal/middleware"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // dummyProjectHash is used for timing-safe login — prevents user enumeration via timing.
@@ -215,7 +216,10 @@ func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 
 	var req signupRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		// Empty body is OK for anonymous sign-in
+		if err != io.EOF {
+			writeError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
 		req = signupRequest{}
 	}
 
@@ -285,7 +289,7 @@ func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 			raw_app_meta_data, raw_user_meta_data, aud, role, last_sign_in_at)
 		VALUES ($1, $2, $3, $4, $5, 'authenticated', 'authenticated', $6)
 		RETURNING id, created_at, updated_at
-	`, email, string(hash), emailConfirmedAt, string(appMetaJSON), string(userMetaJSON), now,
+	`, email, string(hash), emailConfirmedAt, string(appMetaJSON), string(userMetaJSON), emailConfirmedAt,
 	).Scan(&userID, &createdAt, &updatedAt)
 	if err != nil {
 		if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
@@ -314,17 +318,20 @@ func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 		INSERT INTO auth.identities (user_id, provider_id, identity_data, provider, last_sign_in_at)
 		VALUES ($1, $2, $3, 'email', $4)
 		RETURNING id
-	`, userID, userID, string(identityJSON), now).Scan(&identityID)
+	`, userID, userID, string(identityJSON), emailConfirmedAt).Scan(&identityID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create identity")
 		return
 	}
 
 	// Create session and return tokens
-	session, err := createSession(ctx, pool, project, userID, email, userMetadata, appMetadata, r)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create session")
-		return
+	session := &sessionData{}
+	if project.Autoconfirm {
+		session, err = createSession(ctx, pool, project, userID, email, userMetadata, appMetadata, r)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to create session")
+			return
+		}
 	}
 
 	var emailConfStr *string
@@ -366,6 +373,10 @@ func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
+	if !project.Autoconfirm {
+		resp.User.LastSignInAt = nil
+		resp.User.Identities[0].LastSignInAt = nil
+	}
 	httputil.WriteJSON(w, http.StatusOK, resp)
 }
 
@@ -477,7 +488,8 @@ func (h *Handler) tokenPassword(ctx contextType, w http.ResponseWriter, r *http.
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 
 	// Per-email brute-force protection
-	if isEmailLocked(email) {
+	lockoutKey := project.ID + "\x00" + email
+	if isEmailLocked(lockoutKey) {
 		writeError(w, http.StatusTooManyRequests, "too many login attempts, try again later")
 		return
 	}
@@ -486,28 +498,38 @@ func (h *Handler) tokenPassword(ctx contextType, w http.ResponseWriter, r *http.
 	var emailConfirmedAt *time.Time
 	var rawAppMeta, rawUserMeta []byte
 	var createdAt, updatedAt time.Time
+	var banned bool
 
 	err := pool.QueryRow(ctx, `
 		SELECT id, encrypted_password, email_confirmed_at,
-			raw_app_meta_data, raw_user_meta_data, created_at, updated_at
+			raw_app_meta_data, raw_user_meta_data, created_at, updated_at,
+			COALESCE(banned_until > NOW(),false)
 		FROM auth.users WHERE email = $1 AND deleted_at IS NULL
-	`, email).Scan(&userID, &passwordHash, &emailConfirmedAt, &rawAppMeta, &rawUserMeta, &createdAt, &updatedAt)
+	`, email).Scan(&userID, &passwordHash, &emailConfirmedAt, &rawAppMeta, &rawUserMeta, &createdAt, &updatedAt, &banned)
 	if err != nil {
 		// Perform dummy bcrypt comparison to prevent user enumeration via timing
 		_ = bcrypt.CompareHashAndPassword(dummyProjectHash, []byte(req.Password)) // timing equalization — always fails
-		recordFailedLogin(email)
+		recordFailedLogin(lockoutKey)
 		writeError(w, http.StatusBadRequest, "Invalid login credentials")
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
-		recordFailedLogin(email)
+		recordFailedLogin(lockoutKey)
 		writeError(w, http.StatusBadRequest, "Invalid login credentials")
 		return
 	}
 
 	// Successful login — clear any failed attempt tracking
-	clearLoginAttempts(email)
+	clearLoginAttempts(lockoutKey)
+	if banned {
+		writeError(w, http.StatusForbidden, "User is banned")
+		return
+	}
+	if emailConfirmedAt == nil && !project.Autoconfirm {
+		writeError(w, http.StatusBadRequest, "Email not confirmed")
+		return
+	}
 
 	var appMetadata, userMetadata map[string]interface{}
 	if err := json.Unmarshal(rawAppMeta, &appMetadata); err != nil {
@@ -605,10 +627,12 @@ func (h *Handler) tokenRefresh(ctx contextType, w http.ResponseWriter, r *http.R
 	var emailConfirmedAt *time.Time
 	var rawAppMeta, rawUserMeta []byte
 	var createdAt, updatedAt time.Time
+	var banned, isAnonymous bool
 	err = pool.QueryRow(ctx, `
-		SELECT email, email_confirmed_at, raw_app_meta_data, raw_user_meta_data, created_at, updated_at
+		SELECT email, email_confirmed_at, raw_app_meta_data, raw_user_meta_data, created_at, updated_at,
+			COALESCE(banned_until > NOW(),false),is_anonymous
 		FROM auth.users WHERE id = $1 AND deleted_at IS NULL
-	`, userID).Scan(&emailPtr, &emailConfirmedAt, &rawAppMeta, &rawUserMeta, &createdAt, &updatedAt)
+	`, userID).Scan(&emailPtr, &emailConfirmedAt, &rawAppMeta, &rawUserMeta, &createdAt, &updatedAt, &banned, &isAnonymous)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "User not found")
 		return
@@ -616,6 +640,14 @@ func (h *Handler) tokenRefresh(ctx contextType, w http.ResponseWriter, r *http.R
 	email := ""
 	if emailPtr != nil {
 		email = *emailPtr
+	}
+	if banned {
+		writeError(w, http.StatusForbidden, "User is banned")
+		return
+	}
+	if !isAnonymous && emailConfirmedAt == nil && !project.Autoconfirm {
+		writeError(w, http.StatusBadRequest, "Email not confirmed")
+		return
 	}
 
 	var appMetadata, userMetadata map[string]interface{}
@@ -628,7 +660,11 @@ func (h *Handler) tokenRefresh(ctx contextType, w http.ResponseWriter, r *http.R
 
 	// Generate new tokens
 	now := time.Now()
-	accessToken, expiresAt, expiresAtTime, err := generateUserJWT(project.JWTSecret, project.SiteURL, userID, email, userMetadata, appMetadata, sessionID)
+	method := "password"
+	if isAnonymous {
+		method = "anonymous"
+	}
+	accessToken, expiresAt, expiresAtTime, err := generateUserJWTFull(project.JWTSecret, project.SiteURL, userID, email, userMetadata, appMetadata, sessionID, isAnonymous, method)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to generate token")
 		return
@@ -650,8 +686,14 @@ func (h *Handler) tokenRefresh(ctx contextType, w http.ResponseWriter, r *http.R
 	defer tx.Rollback(ctx)
 
 	// Revoke old token inside tx
-	if _, err := tx.Exec(ctx, `UPDATE auth.refresh_tokens SET revoked = true, updated_at = NOW() WHERE id = $1`, tokenID); err != nil {
+	tag, err := tx.Exec(ctx, `UPDATE auth.refresh_tokens SET revoked = true, updated_at = NOW()
+		WHERE id = $1 AND revoked = false AND (expires_at IS NULL OR expires_at > NOW())`, tokenID)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to revoke old token")
+		return
+	}
+	if tag.RowsAffected() != 1 {
+		writeError(w, http.StatusBadRequest, "Token has been revoked")
 		return
 	}
 
@@ -706,6 +748,7 @@ func (h *Handler) tokenRefresh(ctx contextType, w http.ResponseWriter, r *http.R
 		},
 	}
 
+	resp.User.IsAnonymous = isAnonymous
 	httputil.WriteJSON(w, http.StatusOK, resp)
 }
 
@@ -726,6 +769,11 @@ func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	if !database.UserSessionEligible(ctx, pool, userID, project.Autoconfirm) {
+		writeError(w, http.StatusUnauthorized, "user session is inactive")
+		return
+	}
+
 	user, err := fetchUser(ctx, pool, userID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "user not found")
@@ -757,6 +805,10 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	if !database.UserSessionEligible(ctx, pool, userID, project.Autoconfirm) {
+		writeError(w, http.StatusUnauthorized, "user session is inactive")
+		return
+	}
 
 	// Validate password constraints before starting a transaction
 	if req.Password != "" {
@@ -837,9 +889,15 @@ func (h *Handler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "email already in use")
 			return
 		}
-		if _, err := tx.Exec(ctx, `UPDATE auth.users SET email = $1, updated_at = NOW() WHERE id = $2`, newEmail, userID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE auth.users SET email = $1::text,
+			email_confirmed_at = CASE WHEN email=$1::text THEN email_confirmed_at WHEN $3 THEN NOW() ELSE NULL END,
+			updated_at = NOW() WHERE id = $2`, newEmail, userID, project.Autoconfirm); err != nil {
 			slog.Error("failed to update email", "error", err, "user_id", userID)
 			writeError(w, http.StatusInternalServerError, "failed to update email")
+			return
+		}
+		if _, err := tx.Exec(ctx, `UPDATE auth.identities SET identity_data = identity_data || jsonb_build_object('email',$1::text,'email_verified',$3::boolean),updated_at=NOW() WHERE user_id=$2 AND provider='email'`, newEmail, userID, project.Autoconfirm); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to update identity")
 			return
 		}
 	}

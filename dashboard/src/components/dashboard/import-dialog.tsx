@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { imports, type ImportTask, type DumpAnalysis } from "@/lib/api";
@@ -76,7 +78,7 @@ export function ImportDialog({ projectId, onComplete }: ImportDialogProps) {
   }, []);
 
   // Analyze the file when it's selected
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     if (!file || !token) {
       setAnalysis(null);
       setAnalyzing(false);
@@ -111,7 +113,7 @@ export function ImportDialog({ projectId, onComplete }: ImportDialogProps) {
     return () => {
       cancelled = true;
     };
-  }, [file, token, projectId]);
+  }), [file, token, projectId]);
 
   // Poll for status
   useEffect(() => {
@@ -144,7 +146,7 @@ export function ImportDialog({ projectId, onComplete }: ImportDialogProps) {
         pollRef.current = null;
       }
     };
-  }, [activeTask?.id, activeTask?.status, token, projectId, onComplete]);
+  }, [activeTask, token, projectId, onComplete]);
 
   const validateFile = (f: File): string | null => {
     const ext = f.name.slice(f.name.lastIndexOf(".")).toLowerCase();

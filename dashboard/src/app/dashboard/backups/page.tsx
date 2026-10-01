@@ -1,16 +1,17 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useEffect, useState, useCallback } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { useOrg } from "@/lib/org-context";
 import {
   backups as backupsApi,
-  imports as importsApi,
+
   projects as projectsApi,
   type BackupSettings,
   type BackupHistoryItem,
   type Project,
-  type ImportTask,
 } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
@@ -33,7 +34,6 @@ import {
 } from "@/components/ui/select";
 import {
   AlertDialog,
-  AlertDialogAction,
   AlertDialogCancel,
   AlertDialogContent,
   AlertDialogDescription,
@@ -135,10 +135,10 @@ export default function BackupsPage() {
     setLoading(false);
   }, [token, orgId]);
 
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     setLoading(true);
     load();
-  }, [load]);
+  }), [load]);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -211,7 +211,7 @@ export default function BackupsPage() {
   const handleToggle = async () => {
     if (!token || !togglePassword) return;
     setToggling(true);
-    const { data, error } = await backupsApi.toggleEnabled(token, toggleTarget, togglePassword);
+    const { data, error } = await backupsApi.toggleEnabled(token, toggleTarget, togglePassword, activeOrg?.id);
     setToggling(false);
 
     if (error) {

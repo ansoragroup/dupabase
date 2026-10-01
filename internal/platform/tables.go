@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
@@ -83,12 +82,14 @@ type TableInfo struct {
 
 // ColumnInfo represents a column in a database table.
 type ColumnInfo struct {
-	Name      string  `json:"name"`
-	Type      string  `json:"type"`
-	Nullable  bool    `json:"nullable"`
-	Default   *string `json:"default"`
-	MaxLength *int    `json:"max_length,omitempty"`
-	Precision *int    `json:"precision,omitempty"`
+	Name       string  `json:"name"`
+	Type       string  `json:"type"`
+	Nullable   bool    `json:"nullable"`
+	Default    *string `json:"default"`
+	MaxLength  *int    `json:"max_length,omitempty"`
+	Precision  *int    `json:"precision,omitempty"`
+	PrimaryKey bool    `json:"primary_key"`
+	Unique     bool    `json:"unique"`
 }
 
 // TableRowsResponse contains paginated row data for a table.
@@ -113,6 +114,9 @@ func (s *TableService) getProjectPool(ctx context.Context, projectID string) (*p
 
 // validateSchemaTable validates schema and table name identifiers.
 func validateSchemaTable(schema, table string) error {
+	if strings.HasPrefix(strings.ToLower(schema), "pg_") || schema == "auth" || schema == "platform" || schema == "information_schema" || schema == "extensions" {
+		return fmt.Errorf("access to this schema is not allowed")
+	}
 	if !isSafeIdentifier(schema) {
 		return fmt.Errorf("invalid schema name")
 	}
@@ -136,7 +140,8 @@ func (s *TableService) ListTables(ctx context.Context, projectID string) ([]Tabl
 			(SELECT COUNT(*) FROM information_schema.columns c
 			 WHERE c.table_schema = t.table_schema AND c.table_name = t.table_name) as column_count
 		FROM information_schema.tables t
-		WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'platform')
+		WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'platform', 'auth', 'extensions')
+			AND table_schema NOT LIKE 'pg_%'
 			AND table_type = 'BASE TABLE'
 		ORDER BY table_schema, table_name
 	`)
@@ -174,8 +179,10 @@ func (s *TableService) GetTableColumns(ctx context.Context, projectID, schema, t
 
 	rows, err := pool.Query(ctx, `
 		SELECT column_name, data_type, is_nullable, column_default,
-			character_maximum_length, numeric_precision
-		FROM information_schema.columns
+			character_maximum_length, numeric_precision,
+			EXISTS(SELECT 1 FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_attribute a ON a.attrelid=t.oid AND a.attname=c.column_name WHERE n.nspname=$1 AND t.relname=$2 AND i.indisprimary AND a.attnum=ANY(i.indkey)) AS primary_key,
+			EXISTS(SELECT 1 FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_attribute a ON a.attrelid=t.oid AND a.attname=c.column_name WHERE n.nspname=$1 AND t.relname=$2 AND i.indisunique AND i.indisvalid AND i.indnkeyatts=1 AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indkey[0]=a.attnum) AS unique
+		FROM information_schema.columns c
 		WHERE table_schema = $1 AND table_name = $2
 		ORDER BY ordinal_position
 	`, schema, tableName)
@@ -188,7 +195,7 @@ func (s *TableService) GetTableColumns(ctx context.Context, projectID, schema, t
 	for rows.Next() {
 		var c ColumnInfo
 		var isNullable string
-		if err := rows.Scan(&c.Name, &c.Type, &isNullable, &c.Default, &c.MaxLength, &c.Precision); err != nil {
+		if err := rows.Scan(&c.Name, &c.Type, &isNullable, &c.Default, &c.MaxLength, &c.Precision, &c.PrimaryKey, &c.Unique); err != nil {
 			return nil, http.StatusInternalServerError, fmt.Errorf("scan column: %w", err)
 		}
 		c.Nullable = isNullable == "YES"
@@ -402,7 +409,25 @@ func (s *TableService) UpdateRow(ctx context.Context, projectID, schema, tableNa
 		i,
 	)
 
-	tag, err := pool.Exec(ctx, query, values...)
+	return executeSingleRowMutation(ctx, pool, schema, tableName, pkColumn, query, values...)
+}
+
+func executeSingleRowMutation(ctx context.Context, pool *pgxpool.Pool, schema, table, pkColumn, query string, values ...interface{}) (int, error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	defer tx.Rollback(ctx)
+	var unique bool
+	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_attribute a ON a.attrelid=t.oid AND a.attname=$3
+		WHERE n.nspname=$1 AND t.relname=$2 AND i.indisunique AND i.indisvalid AND i.indnkeyatts=1 AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indkey[0]=a.attnum)`, schema, table, pkColumn).Scan(&unique)
+	if err != nil {
+		return http.StatusInternalServerError, err
+	}
+	if !unique {
+		return http.StatusBadRequest, fmt.Errorf("row identity must be a single-column primary or unique key")
+	}
+	tag, err := tx.Exec(ctx, query, values...)
 	if err != nil {
 		return http.StatusBadRequest, fmt.Errorf("update row: %w", err)
 	}
@@ -411,7 +436,12 @@ func (s *TableService) UpdateRow(ctx context.Context, projectID, schema, tableNa
 		return http.StatusNotFound, fmt.Errorf("row not found")
 	}
 
-	slog.Info("row updated", "project_id", projectID, "table", schema+"."+tableName, "pk", pkColumn, "pk_value", pkValue)
+	if tag.RowsAffected() != 1 {
+		return http.StatusConflict, fmt.Errorf("row mutation would affect multiple rows")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return http.StatusInternalServerError, err
+	}
 	return http.StatusOK, nil
 }
 
@@ -432,15 +462,5 @@ func (s *TableService) DeleteRow(ctx context.Context, projectID, schema, tableNa
 	qualifiedTable := quoteIdent(schema) + "." + quoteIdent(tableName)
 	query := fmt.Sprintf(`DELETE FROM %s WHERE %s = $1`, qualifiedTable, quoteIdent(pkColumn))
 
-	tag, err := pool.Exec(ctx, query, pkValue)
-	if err != nil {
-		return http.StatusBadRequest, fmt.Errorf("delete row: %w", err)
-	}
-
-	if tag.RowsAffected() == 0 {
-		return http.StatusNotFound, fmt.Errorf("row not found")
-	}
-
-	slog.Info("row deleted", "project_id", projectID, "table", schema+"."+tableName, "pk", pkColumn, "pk_value", pkValue)
-	return http.StatusOK, nil
+	return executeSingleRowMutation(ctx, pool, schema, tableName, pkColumn, query, pkValue)
 }

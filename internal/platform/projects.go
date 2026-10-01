@@ -97,17 +97,21 @@ func (s *ProjectService) CreateProject(ctx context.Context, userID string, req C
 	var projectID string
 	var createdAt time.Time
 
-	enableSignup := true
+	defaults := s.poolManager.Config()
+	enableSignup := defaults.DefaultEnableSignup
 	if req.EnableSignup != nil {
 		enableSignup = *req.EnableSignup
 	}
-	autoconfirm := true
+	autoconfirm := defaults.DefaultAutoconfirm
 	if req.Autoconfirm != nil {
 		autoconfirm = *req.Autoconfirm
 	}
-	passwordMinLen := 6
+	passwordMinLen := defaults.DefaultPasswordMinLength
 	if req.PasswordMinLength != nil {
 		passwordMinLen = *req.PasswordMinLength
+	}
+	if passwordMinLen < 6 || passwordMinLen > 72 {
+		return nil, http.StatusBadRequest, fmt.Errorf("password_min_length must be between 6 and 72")
 	}
 
 	err = s.platformDB.QueryRow(ctx, `
@@ -149,38 +153,23 @@ func (s *ProjectService) CreateProject(ctx context.Context, userID string, req C
 	}
 
 	// Connect to the new database and run migrations
-	projectPool, err := s.poolManager.GetPool(ctx, projectID)
+	projectPool, err := s.poolManager.ProvisioningPool(ctx, dbName)
 	if err != nil {
-		// Try direct connection since the project cache might not have the record yet
-		// due to status still being 'creating'. Force a cache invalidation and retry.
-		s.poolManager.InvalidateProjectCache(projectID)
-
-		// Temporarily set to active so pool manager can find it
-		s.platformDB.Exec(ctx, `UPDATE platform.projects SET status = 'active' WHERE id = $1`, projectID)
-		s.poolManager.InvalidateProjectCache(projectID)
-		projectPool, err = s.poolManager.GetPool(ctx, projectID)
-		if err != nil {
-			cleanupOnError()
-			return nil, http.StatusInternalServerError, fmt.Errorf("connect to new db: %w", err)
-		}
+		cleanupOnError()
+		return nil, http.StatusInternalServerError, fmt.Errorf("connect to new db: %w", err)
 	}
 
 	// Run project migrations
 	err = database.RunMigrations(ctx, projectPool, projectMigrations())
+	projectPool.Close()
 	if err != nil {
 		cleanupOnError()
 		return nil, http.StatusInternalServerError, fmt.Errorf("run migrations: %w", err)
 	}
 
-	// Grant the PG user ability to SET ROLE to anon/authenticated/service_role
-	grantSQL := fmt.Sprintf(`
-		GRANT anon TO "%s";
-		GRANT authenticated TO "%s";
-	`, pgUsername, pgUsername)
-	_, err = projectPool.Exec(ctx, grantSQL)
-	if err != nil {
-		// Non-fatal — roles might already be granted
-		slog.Warn("Failed to grant roles", "username", pgUsername, "error", err)
+	if err := s.poolManager.ProvisionProjectLogin(ctx, projectID, dbName, pgUsername); err != nil {
+		cleanupOnError()
+		return nil, http.StatusInternalServerError, fmt.Errorf("provision project login: %w", err)
 	}
 
 	// Generate anon_key and service_role_key
@@ -321,6 +310,9 @@ func (s *ProjectService) DeleteProject(ctx context.Context, orgID, projectID str
 	_, err = s.platformDB.Exec(ctx, fmt.Sprintf(`DROP DATABASE IF EXISTS "%s"`, dbName))
 	if err != nil {
 		return http.StatusInternalServerError, fmt.Errorf("drop database: %w", err)
+	}
+	if err := s.poolManager.DropProjectLogin(ctx, projectID); err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("drop project login: %w", err)
 	}
 
 	// Mark as deleted

@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth-context";
@@ -97,13 +99,13 @@ export default function AdminPage() {
     setLoading(false);
   }, [token]);
 
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     if (!user?.is_admin) {
       router.replace("/dashboard");
       return;
     }
     loadData();
-  }, [user, router, loadData]);
+  }), [user, router, loadData]);
 
   const handleModeChange = async (mode: string) => {
     if (!token) return;

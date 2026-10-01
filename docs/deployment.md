@@ -319,8 +319,9 @@ Add these in Settings → Secrets → Actions:
 
 | Secret | Description |
 |--------|-------------|
-| `WATCHTOWER_URL` | Watchtower endpoint (e.g., `http://your-server:8080`) |
+| `WATCHTOWER_ENDPOINT` | Watchtower endpoint (e.g., `http://your-server:8080`) |
 | `WATCHTOWER_TOKEN` | Watchtower HTTP API token |
+| `DEPLOY_HEALTH_URL` | Optional health endpoint; defaults to `https://api.dupabase.dev/health` |
 
 `GITHUB_TOKEN` is provided automatically for GHCR access.
 

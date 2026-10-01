@@ -3,7 +3,10 @@ package platform
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -14,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ansoraGROUP/dupabase/internal/database"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -21,18 +25,42 @@ import (
 type ImportService struct {
 	db          *pgxpool.Pool
 	databaseURL string
+	poolManager *database.PoolManager
 
-	mu        sync.Mutex
-	processes map[int64]*exec.Cmd // taskID -> running process for cancellation
+	mu             sync.Mutex
+	processes      map[int64]*exec.Cmd // taskID -> running process for cancellation
+	cancels        map[int64]context.CancelFunc
+	activeProjects map[string]bool
 }
 
 // NewImportService creates a new ImportService.
 func NewImportService(db *pgxpool.Pool, databaseURL string) *ImportService {
 	return &ImportService{
-		db:          db,
-		databaseURL: databaseURL,
-		processes:   make(map[int64]*exec.Cmd),
+		db:             db,
+		databaseURL:    databaseURL,
+		processes:      make(map[int64]*exec.Cmd),
+		cancels:        make(map[int64]context.CancelFunc),
+		activeProjects: make(map[string]bool),
 	}
+}
+
+func (s *ImportService) SetPoolManager(pm *database.PoolManager) { s.poolManager = pm }
+
+func (s *ImportService) projectDBURL(ctx context.Context, dbName string) (string, error) {
+	if s.poolManager == nil {
+		return "", fmt.Errorf("project credential provider is not configured")
+	}
+	return s.poolManager.ProjectDatabaseURL(ctx, dbName)
+}
+
+func (s *ImportService) reserveJob(projectID string) (func(), error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeProjects[projectID] || len(s.activeProjects) >= 4 {
+		return nil, fmt.Errorf("an import is already running or all import workers are busy")
+	}
+	s.activeProjects[projectID] = true
+	return func() { s.mu.Lock(); delete(s.activeProjects, projectID); s.mu.Unlock() }, nil
 }
 
 // ImportOptions controls import behavior.
@@ -105,7 +133,7 @@ var sqlFilterPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)^\s*CREATE\s+(UNIQUE\s+)?INDEX\s+.+\bON\s+auth\.`),
 	regexp.MustCompile(`(?i)^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?extensions\.`),
 	regexp.MustCompile(`(?i)^\s*ALTER\s+TABLE\s+(ONLY\s+)?extensions\.`),
-	regexp.MustCompile(`(?i)^\s*COPY\s+auth\.`),
+	regexp.MustCompile(`(?i)^\s*COPY\s+(auth|extensions)\.`),
 	regexp.MustCompile(`(?i)^\s*INSERT\s+INTO\s+auth\.`),
 	regexp.MustCompile(`(?i)^\s*CREATE\s+ROLE\b`),
 	regexp.MustCompile(`(?i)^\s*ALTER\s+ROLE\b`),
@@ -114,25 +142,18 @@ var sqlFilterPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)^\s*CREATE\s+(OR\s+REPLACE\s+)?FUNCTION\s+auth\.`),
 	regexp.MustCompile(`(?i)^\s*CREATE\s+TRIGGER\s+.*\bON\s+auth\.`),
 	regexp.MustCompile(`(?i)^\s*CREATE\s+POLICY\s+.*\bON\s+auth\.`),
-	regexp.MustCompile(`(?i)^\s*(ALTER\s+TABLE.*)?ENABLE\s+ROW\s+LEVEL\s+SECURITY`),
 	regexp.MustCompile(`(?i)^\s*CREATE\s+EXTENSION\b`),
 	regexp.MustCompile(`(?i)^\s*COMMENT\s+ON\s+EXTENSION\b`),
 	regexp.MustCompile(`(?i)^\s*SET\s+.*search_path\s*=.*\bauth\b`),
 }
 
 // TOC filter patterns for custom dump format.
-// These match against pg_restore --list output where schema names are
-// space-separated fields (e.g., "TABLE auth users postgres"), not
-// dot-qualified identifiers, so we use \b word boundaries.
-// NOTE: The SQL filter does not handle backslash continuation lines.
-// Multi-line statements split with \ may not be filtered correctly.
+// Match the actual schema field, so a public table/function named "auth" or
+// "extensions" is preserved. This is a compatibility filter, not isolation.
 var tocFilterPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)\bauth\b`),
-	regexp.MustCompile(`(?i)\bextensions\b`),
-	regexp.MustCompile(`(?i)\bsupabase_`),
-	regexp.MustCompile(`(?i)\bCREATE ROLE\b`),
-	regexp.MustCompile(`(?i)\bALTER ROLE\b`),
-	regexp.MustCompile(`(?i)\bCREATE EXTENSION\b`),
+	regexp.MustCompile(`^\s*\d+;\s+\d+\s+\d+\s+[A-Z][A-Z ]*\s+(auth|extensions|supabase_[a-z0-9_]*)\s`),
+	regexp.MustCompile(`^\s*\d+;\s+\d+\s+\d+\s+(SCHEMA|ACL|COMMENT)\s+-\s+(SCHEMA\s+)?(auth|extensions|supabase_[a-z0-9_]*)\s`),
+	regexp.MustCompile(`^\s*\d+;\s+\d+\s+\d+\s+(CREATE ROLE|ALTER ROLE|CREATE EXTENSION)\s`),
 }
 
 // StartImport validates the project exists and is active, saves metadata, and launches async import.
@@ -150,6 +171,10 @@ func (s *ImportService) StartImport(ctx context.Context, userID, projectID, file
 
 	// Detect format
 	format := detectFormat(filePath)
+	release, err := s.reserveJob(projectID)
+	if err != nil {
+		return nil, http.StatusTooManyRequests, err
+	}
 
 	// Insert task record
 	var taskID int64
@@ -162,11 +187,12 @@ func (s *ImportService) StartImport(ctx context.Context, userID, projectID, file
 			opts.CleanImport, opts.SkipAuthSchema, opts.DisableTriggers),
 	).Scan(&taskID)
 	if err != nil {
+		release()
 		return nil, http.StatusInternalServerError, fmt.Errorf("create import task: %w", err)
 	}
 
 	// Launch async import
-	go s.executeImport(taskID, dbName, filePath, format, opts)
+	go func() { defer release(); s.executeImport(taskID, dbName, filePath, format, opts) }()
 
 	task := &ImportTaskResponse{
 		ID:        taskID,
@@ -233,39 +259,30 @@ func (s *ImportService) GetImportHistory(ctx context.Context, projectID string) 
 
 // CancelImport cancels a running import.
 func (s *ImportService) CancelImport(ctx context.Context, taskID int64) (int, error) {
-	// Verify running status
-	var status string
-	err := s.db.QueryRow(ctx, `
+	// Claim cancellation before signalling the worker; a completed job must not
+	// be overwritten by a concurrent cancellation or a late worker error.
+	tag, err := s.db.Exec(ctx, `UPDATE platform.import_tasks
+		SET status='cancelled', completed_at=NOW() WHERE id=$1 AND status='running'`, taskID)
+	if err != nil {
+		return http.StatusInternalServerError, fmt.Errorf("cancel import: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		var status string
+		err = s.db.QueryRow(ctx, `
 		SELECT status FROM platform.import_tasks
 		WHERE id = $1
 	`, taskID).Scan(&status)
-	if err != nil {
-		return http.StatusNotFound, fmt.Errorf("import task not found")
-	}
-	if status != "running" {
+		if err != nil {
+			return http.StatusNotFound, fmt.Errorf("import task not found")
+		}
 		return http.StatusBadRequest, fmt.Errorf("import is not running (status: %s)", status)
 	}
 
-	// Kill process if exists — copy the process pointer while holding the lock
-	// to avoid a race where the process finishes between Unlock and Kill.
 	s.mu.Lock()
-	cmd, ok := s.processes[taskID]
-	var proc *os.Process
-	if ok && cmd.Process != nil {
-		proc = cmd.Process
-	}
+	cancel := s.cancels[taskID]
 	s.mu.Unlock()
-
-	if proc != nil {
-		_ = proc.Kill()
-	}
-
-	if _, err := s.db.Exec(ctx, `
-		UPDATE platform.import_tasks
-		SET status = 'cancelled', completed_at = NOW()
-		WHERE id = $1
-	`, taskID); err != nil {
-		slog.Error("failed to mark import as cancelled", "task_id", taskID, "error", err)
+	if cancel != nil {
+		cancel()
 	}
 
 	return http.StatusOK, nil
@@ -277,17 +294,27 @@ func (s *ImportService) CancelImport(ctx context.Context, taskID int64) (int, er
 func (s *ImportService) executeImport(taskID int64, dbName, filePath, format string, opts ImportOptions) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()
+	s.mu.Lock()
+	s.cancels[taskID] = cancel
+	s.mu.Unlock()
+
 	defer os.Remove(filePath)
 
 	defer func() {
 		// Clean up process reference
 		s.mu.Lock()
 		delete(s.processes, taskID)
+		delete(s.cancels, taskID)
 		s.mu.Unlock()
 	}()
 
+	var taskStatus string
+	if err := s.db.QueryRow(ctx, `SELECT status FROM platform.import_tasks WHERE id=$1`, taskID).Scan(&taskStatus); err != nil || taskStatus != "running" {
+		return
+	}
+
 	// Build target database URL
-	dbURL, err := s.buildDBURL(dbName)
+	dbURL, err := s.projectDBURL(ctx, dbName)
 	if err != nil {
 		s.markImportFailed(ctx, taskID, fmt.Sprintf("build DB URL: %v", err))
 		return
@@ -300,6 +327,21 @@ func (s *ImportService) executeImport(taskID int64, dbName, filePath, format str
 			return
 		}
 	}
+	triggersPending := opts.DisableTriggers
+	restoreTriggers := func() error {
+		if !triggersPending {
+			return nil
+		}
+		triggersPending = false
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		return s.postImport(cleanupCtx, dbURL)
+	}
+	defer func() {
+		if err := restoreTriggers(); err != nil {
+			slog.Error("restore import triggers", "task_id", taskID, "error", err)
+		}
+	}()
 
 	var importErr error
 	var tableCount int
@@ -311,8 +353,8 @@ func (s *ImportService) executeImport(taskID int64, dbName, filePath, format str
 	}
 
 	// Post-import: re-enable triggers
-	if opts.DisableTriggers {
-		s.postImport(ctx, dbURL)
+	if err := restoreTriggers(); err != nil && importErr == nil {
+		importErr = err
 	}
 
 	if importErr != nil {
@@ -338,7 +380,7 @@ func (s *ImportService) executeImport(taskID int64, dbName, filePath, format str
 	if _, err := s.db.Exec(ctx, `
 		UPDATE platform.import_tasks
 		SET status = 'completed', tables_imported = $1, completed_at = NOW()
-		WHERE id = $2
+		WHERE id = $2 AND status = 'running'
 	`, tableCount, taskID); err != nil {
 		slog.Error("failed to mark import as completed", "task_id", taskID, "error", err)
 	}
@@ -359,7 +401,7 @@ func (s *ImportService) preImport(ctx context.Context, dbURL string, opts Import
 	var stmts []string
 
 	if opts.DisableTriggers {
-		stmts = append(stmts, "SET session_replication_role = 'replica';")
+		stmts = append(stmts, "DO $$ DECLARE r RECORD; BEGIN FOR r IN (SELECT schemaname,tablename FROM pg_tables WHERE schemaname='public') LOOP EXECUTE format('ALTER TABLE %I.%I DISABLE TRIGGER USER',r.schemaname,r.tablename); END LOOP; END $$;")
 	}
 
 	if opts.CleanImport {
@@ -372,7 +414,7 @@ func (s *ImportService) preImport(ctx context.Context, dbURL string, opts Import
 		return nil
 	}
 
-	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	host, port, user, _, dbName, err := splitDBURL(dbURL)
 	if err != nil {
 		return fmt.Errorf("parse DB URL: %w", err)
 	}
@@ -382,29 +424,29 @@ func (s *ImportService) preImport(ctx context.Context, dbURL string, opts Import
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		"-c", sqlStr,
 	)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
-	out, err := cmd.CombinedOutput()
+	cmd.Env = pgCommandEnv(dbURL)
+	out, err := runBoundedCommand(cmd)
 	if err != nil {
 		return fmt.Errorf("pre-import SQL: %s: %w", string(out), err)
 	}
 	return nil
 }
 
-func (s *ImportService) postImport(ctx context.Context, dbURL string) {
-	host, port, user, password, dbName, err := splitDBURL(dbURL)
+func (s *ImportService) postImport(ctx context.Context, dbURL string) error {
+	host, port, user, _, dbName, err := splitDBURL(dbURL)
 	if err != nil {
-		slog.Warn("postImport: failed to parse DB URL", "error", err)
-		return
+		return fmt.Errorf("post-import DB URL: %w", err)
 	}
 	cmd := exec.CommandContext(ctx, "psql",
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
-		"-c", "SET session_replication_role = 'origin';",
+		"-c", "DO $$ DECLARE r RECORD; BEGIN FOR r IN (SELECT schemaname,tablename FROM pg_tables WHERE schemaname='public') LOOP EXECUTE format('ALTER TABLE %I.%I ENABLE TRIGGER USER',r.schemaname,r.tablename); END LOOP; END $$;",
 	)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
-	out, err := cmd.CombinedOutput()
+	cmd.Env = pgCommandEnv(dbURL)
+	out, err := runBoundedCommand(cmd)
 	if err != nil {
-		slog.Warn("postImport command failed", "error", err, "output", string(out))
+		return fmt.Errorf("re-enable import triggers: %s: %w", out, err)
 	}
+	return nil
 }
 
 // importCustomDump handles pg_restore for custom format dumps.
@@ -417,13 +459,15 @@ func (s *ImportService) importCustomDump(ctx context.Context, taskID int64, dbUR
 		return s.importCustomDumpFiltered(cancelCtx, taskID, dbURL, filePath)
 	}
 
-	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	host, port, user, _, dbName, err := splitDBURL(dbURL)
 	if err != nil {
 		return 0, fmt.Errorf("parse DB URL: %w", err)
 	}
 
 	// Direct restore (--clean --if-exists drops before creating)
 	cmd := exec.CommandContext(cancelCtx, "pg_restore",
+		"--exit-on-error",
+		"--exclude-schema=platform",
 		"--no-owner",
 		"--no-acl",
 		"--clean",
@@ -431,21 +475,18 @@ func (s *ImportService) importCustomDump(ctx context.Context, taskID int64, dbUR
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		filePath,
 	)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+	cmd.Env = pgCommandEnv(dbURL)
 
 	s.mu.Lock()
 	s.processes[taskID] = cmd
 	s.mu.Unlock()
 
-	out, err := cmd.CombinedOutput()
+	out, err := runBoundedCommand(cmd)
 	if err != nil {
 		// pg_restore returns exit code 1 for warnings too, check output
 		outStr := string(out)
-		if isOnlyWarnings(outStr) {
-			slog.Warn("pg_restore completed with warnings", "task_id", taskID, "output", outStr)
-		} else {
-			return 0, fmt.Errorf("pg_restore: %s", outStr)
-		}
+		return 0, fmt.Errorf("pg_restore: %s", outStr)
+
 	}
 
 	tableCount := countRestoredTables(ctx, dbURL)
@@ -456,7 +497,8 @@ func (s *ImportService) importCustomDump(ctx context.Context, taskID int64, dbUR
 func (s *ImportService) importCustomDumpFiltered(ctx context.Context, taskID int64, dbURL, filePath string) (int, error) {
 	// Step 1: Get TOC listing
 	listCmd := exec.CommandContext(ctx, "pg_restore", "--list", filePath)
-	tocOutput, err := listCmd.Output()
+	listCmd.Env = pgCommandEnv("")
+	tocOutput, err := runBoundedCommand(listCmd)
 	if err != nil {
 		return 0, fmt.Errorf("pg_restore --list: %w", err)
 	}
@@ -478,12 +520,14 @@ func (s *ImportService) importCustomDumpFiltered(ctx context.Context, taskID int
 	tocFile.Close()
 
 	// Step 4: Restore with filtered TOC (--clean --if-exists drops before creating)
-	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	host, port, user, _, dbName, err := splitDBURL(dbURL)
 	if err != nil {
 		return 0, fmt.Errorf("parse DB URL: %w", err)
 	}
 
 	cmd := exec.CommandContext(ctx, "pg_restore",
+		"--exit-on-error",
+		"--exclude-schema=platform",
 		"--no-owner",
 		"--no-acl",
 		"--clean",
@@ -492,20 +536,17 @@ func (s *ImportService) importCustomDumpFiltered(ctx context.Context, taskID int
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		filePath,
 	)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+	cmd.Env = pgCommandEnv(dbURL)
 
 	s.mu.Lock()
 	s.processes[taskID] = cmd
 	s.mu.Unlock()
 
-	out, err := cmd.CombinedOutput()
+	out, err := runBoundedCommand(cmd)
 	if err != nil {
 		outStr := string(out)
-		if isOnlyWarnings(outStr) {
-			slog.Warn("pg_restore (filtered) completed with warnings", "task_id", taskID, "output", outStr)
-		} else {
-			return 0, fmt.Errorf("pg_restore: %s", outStr)
-		}
+		return 0, fmt.Errorf("pg_restore: %s", outStr)
+
 	}
 
 	tableCount := countRestoredTables(ctx, dbURL)
@@ -517,43 +558,43 @@ func (s *ImportService) importPlainSQL(ctx context.Context, taskID int64, dbURL,
 	cancelCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 
-	importFile := filePath
-
-	if opts.SkipAuthSchema {
-		// Filter the SQL file
-		filtered, err := filterSQLFile(filePath)
-		if err != nil {
-			return 0, fmt.Errorf("filter SQL: %w", err)
-		}
-		importFile = filtered
-		defer os.Remove(filtered)
+	importFile, err := filterSQLFileOptions(filePath, opts.SkipAuthSchema)
+	if err != nil {
+		return 0, fmt.Errorf("filter SQL: %w", err)
 	}
+	defer os.Remove(importFile)
+	input, err := os.Open(importFile)
+	if err != nil {
+		return 0, err
+	}
+	defer input.Close()
 
-	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	host, port, user, _, dbName, err := splitDBURL(dbURL)
 	if err != nil {
 		return 0, fmt.Errorf("parse DB URL: %w", err)
 	}
 
 	cmd := exec.CommandContext(cancelCtx, "psql",
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
-		"-f", importFile,
+		"-X", "--set=ON_ERROR_STOP=on",
 	)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+	// Restriction belongs to the worker, not the uploaded dump. On older psql,
+	// the unknown command is fatal, rather than silently running unprotected.
+	keyBytes := make([]byte, 32)
+	if _, err := rand.Read(keyBytes); err != nil {
+		return 0, err
+	}
+	key := hex.EncodeToString(keyBytes)
+	cmd.Stdin = io.MultiReader(strings.NewReader("\\restrict "+key+"\n"), input, strings.NewReader("\n"))
+	cmd.Env = pgCommandEnv(dbURL)
 
 	s.mu.Lock()
 	s.processes[taskID] = cmd
 	s.mu.Unlock()
 
-	out, err := cmd.CombinedOutput()
+	out, err := runBoundedCommand(cmd)
 	outStr := string(out)
 	if err != nil {
-		// psql can return errors for non-critical things (duplicate keys, etc.)
-		// Check if we got at least some tables imported
-		tableCount := countRestoredTables(cancelCtx, dbURL)
-		if tableCount > 0 {
-			slog.Warn("psql import completed with errors", "task_id", taskID, "tables", tableCount, "stderr", outStr)
-			return tableCount, nil
-		}
 		return 0, fmt.Errorf("psql import: %s", outStr)
 	}
 
@@ -566,11 +607,16 @@ func (s *ImportService) importPlainSQL(ctx context.Context, taskID int64, dbURL,
 
 func (s *ImportService) markImportFailed(ctx context.Context, taskID int64, errMsg string) {
 	slog.Error("Import failed", "task_id", taskID, "error", errMsg)
-	s.db.Exec(ctx, `
+	updateCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := s.db.Exec(updateCtx, `
 		UPDATE platform.import_tasks
 		SET status = 'failed', error_message = $1, completed_at = NOW()
-		WHERE id = $2
+		WHERE id = $2 AND status = 'running'
 	`, errMsg, taskID)
+	if err != nil {
+		slog.Error("record failed import", "task_id", taskID, "error", err)
+	}
 }
 
 // splitDBURL parses a PostgreSQL connection URL into its components.
@@ -646,130 +692,6 @@ func filterTOC(toc string) string {
 	return filtered.String()
 }
 
-// filterSQLFile creates a filtered copy of a SQL file, removing auth schema statements.
-// Handles multi-line CREATE FUNCTION with $$-quoted bodies and COPY blocks.
-func filterSQLFile(inputPath string) (string, error) {
-	input, err := os.Open(inputPath)
-	if err != nil {
-		return "", fmt.Errorf("open input: %w", err)
-	}
-	defer input.Close()
-
-	output, err := os.CreateTemp("", "import-filtered-*.sql")
-	if err != nil {
-		return "", fmt.Errorf("create output: %w", err)
-	}
-
-	writer := bufio.NewWriter(output)
-	scanner := bufio.NewScanner(input)
-	buf := make([]byte, 0, 1024*1024)
-	scanner.Buffer(buf, 10*1024*1024)
-
-	// State machine for filtering
-	type skipState int
-	const (
-		stateNormal  skipState = iota
-		stateCopy              // skipping COPY block until \.
-		stateDollar            // skipping $$-quoted body until $$;
-		stateMulti             // skipping multi-line statement until ;
-		stateMultiDQ           // skipping multi-line that entered a $$ block
-	)
-
-	state := stateNormal
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		trimmed := strings.TrimSpace(line)
-
-		switch state {
-		case stateCopy:
-			if line == "\\." {
-				state = stateNormal
-			}
-			continue
-
-		case stateDollar:
-			if strings.Contains(line, "$$") {
-				state = stateNormal
-			}
-			continue
-
-		case stateMulti:
-			// Inside a multi-line filtered statement
-			if strings.Contains(line, "$$") && !strings.Contains(line, "$$;") {
-				// Entered a dollar-quoted body inside the filtered statement
-				state = stateMultiDQ
-			} else if strings.HasSuffix(trimmed, ";") || strings.HasSuffix(trimmed, "$$;") {
-				state = stateNormal
-			}
-			continue
-
-		case stateMultiDQ:
-			// Inside dollar-quoted body of a filtered multi-line statement
-			if strings.Contains(line, "$$") {
-				// End of dollar-quote — but statement may continue
-				if strings.HasSuffix(trimmed, ";") {
-					state = stateNormal
-				} else {
-					state = stateMulti
-				}
-			}
-			continue
-		}
-
-		// stateNormal: check if line should be filtered
-
-		// Skip psql meta-commands
-		if strings.HasPrefix(trimmed, "\\restrict") || strings.HasPrefix(trimmed, "\\unrestrict") || strings.HasPrefix(trimmed, "\\connect") {
-			continue
-		}
-
-		upper := strings.ToUpper(trimmed)
-
-		// COPY auth/extensions block → skip until \.
-		if strings.HasPrefix(upper, "COPY AUTH.") || strings.HasPrefix(upper, "COPY EXTENSIONS.") {
-			state = stateCopy
-			continue
-		}
-
-		// Check filter patterns
-		skip := false
-		for _, pattern := range sqlFilterPatterns {
-			if pattern.MatchString(line) {
-				skip = true
-				break
-			}
-		}
-
-		if skip {
-			if strings.Contains(line, "$$") && !strings.Contains(line, "$$;") {
-				// Opens a $$-quoted body (e.g., CREATE FUNCTION auth.jwt() ... AS $$)
-				state = stateDollar
-			} else if strings.HasSuffix(trimmed, ";") || strings.HasSuffix(trimmed, "$$;") {
-				// Single-line statement, already skipped
-				state = stateNormal
-			} else if trimmed != "" {
-				// Multi-line statement (CREATE TABLE auth.xxx (\n  ...
-				state = stateMulti
-			}
-			continue
-		}
-
-		writer.WriteString(line)
-		writer.WriteString("\n")
-	}
-
-	if err := scanner.Err(); err != nil {
-		output.Close()
-		os.Remove(output.Name())
-		return "", fmt.Errorf("scan input: %w", err)
-	}
-
-	writer.Flush()
-	output.Close()
-	return output.Name(), nil
-}
-
 // isOnlyWarnings checks if pg_restore/psql output contains only warnings.
 // Returns true if no error-level lines are found.
 // NOTE: Detects both PostgreSQL ERROR/FATAL/PANIC lines and pg_restore: error: lines.
@@ -803,7 +725,7 @@ func isOnlyWarnings(output string) bool {
 
 // countRestoredTables counts public tables in the target database.
 func countRestoredTables(ctx context.Context, dbURL string) int {
-	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	host, port, user, _, dbName, err := splitDBURL(dbURL)
 	if err != nil {
 		return 0
 	}
@@ -811,7 +733,7 @@ func countRestoredTables(ctx context.Context, dbURL string) int {
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		"-tAc", "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'",
 	)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+	cmd.Env = pgCommandEnv(dbURL)
 	out, err := cmd.Output()
 	if err != nil {
 		return 0
@@ -834,8 +756,11 @@ func (s *ImportService) AnalyzeDump(filePath string) (*DumpAnalysis, int, error)
 
 	if format == "custom" {
 		// For custom format, use pg_restore --list to get TOC and analyze it
-		cmd := exec.Command("pg_restore", "--list", filePath)
-		tocOutput, err := cmd.Output()
+		analysisCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(analysisCtx, "pg_restore", "--list", filePath)
+		cmd.Env = pgCommandEnv("")
+		tocOutput, err := runBoundedCommand(cmd)
 		if err != nil {
 			return nil, http.StatusInternalServerError, fmt.Errorf("pg_restore --list: %w", err)
 		}
@@ -1087,7 +1012,7 @@ func parseCopyRow(line string, columns []string) *supabaseAuthUser {
 // insertMigratedUsers inserts extracted Supabase auth users into the target database.
 // Existing users (by ID or email) are skipped.
 func insertMigratedUsers(ctx context.Context, dbURL string, users []supabaseAuthUser) (int, error) {
-	host, port, user, password, dbName, err := splitDBURL(dbURL)
+	host, port, user, _, dbName, err := splitDBURL(dbURL)
 	if err != nil {
 		return 0, fmt.Errorf("parse DB URL: %w", err)
 	}
@@ -1137,8 +1062,8 @@ func insertMigratedUsers(ctx context.Context, dbURL string, users []supabaseAuth
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		"-f", tmpFile.Name(),
 	)
-	cmd.Env = append(os.Environ(), "PGPASSWORD="+password)
-	out, err := cmd.CombinedOutput()
+	cmd.Env = pgCommandEnv(dbURL)
+	out, err := runBoundedCommand(cmd)
 	if err != nil {
 		outStr := string(out)
 		slog.Warn("auth user migration had errors", "output", outStr)
@@ -1149,7 +1074,7 @@ func insertMigratedUsers(ctx context.Context, dbURL string, users []supabaseAuth
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		"-tAc", "SELECT count(*) FROM auth.users",
 	)
-	countCmd.Env = append(os.Environ(), "PGPASSWORD="+password)
+	countCmd.Env = pgCommandEnv(dbURL)
 	countOut, err := countCmd.Output()
 	if err != nil {
 		return len(users), nil

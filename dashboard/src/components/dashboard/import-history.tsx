@@ -1,5 +1,7 @@
 "use client";
 
+import { deferEffect } from "@/lib/defer-effect";
+
 import { useCallback, useEffect, useState } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { imports, type ImportTask } from "@/lib/api";
@@ -38,9 +40,9 @@ export function ImportHistory({ projectId, refreshKey }: ImportHistoryProps) {
     setLoading(false);
   }, [token, projectId]);
 
-  useEffect(() => {
+  useEffect(() => deferEffect(() => {
     load();
-  }, [load, refreshKey]);
+  }), [load, refreshKey]);
 
   const formatSize = (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`;

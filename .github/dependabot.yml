@@ -1,0 +1,66 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '07:00'
+      timezone: Asia/Tashkent
+    open-pull-requests-limit: 10
+    groups:
+      backend-compatible:
+        patterns: ['*']
+        update-types: [minor, patch]
+      backend-security:
+        applies-to: security-updates
+        patterns: ['*']
+    commit-message:
+      prefix: 'deps(go)'
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '07:15'
+      timezone: Asia/Tashkent
+    open-pull-requests-limit: 10
+    groups:
+      sdk-compatible:
+        patterns: ['*']
+        update-types: [minor, patch]
+      sdk-security:
+        applies-to: security-updates
+        patterns: ['*']
+    commit-message:
+      prefix: 'deps(sdk)'
+  - package-ecosystem: npm
+    directory: /dashboard
+    schedule:
+      interval: weekly
+      day: monday
+      time: '07:30'
+      timezone: Asia/Tashkent
+    open-pull-requests-limit: 10
+    ignore:
+      - dependency-name: '@testing-library/jest-dom'
+        versions: ['6.10.*']
+    groups:
+      dashboard-compatible:
+        patterns: ['*']
+        update-types: [minor, patch]
+      dashboard-security:
+        applies-to: security-updates
+        patterns: ['*']
+    commit-message:
+      prefix: 'deps(dashboard)'
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '07:45'
+      timezone: Asia/Tashkent
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: 'deps(ci)'
