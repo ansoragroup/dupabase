@@ -22,8 +22,8 @@ import { localTestURL } from './local_fixture.mjs';
  *   7. Realtime-style patterns: subscriptions setup (no actual realtime, just client API)
  */
 import { createClient } from '@supabase/supabase-js';
-import { execSync } from 'child_process';
-import { writeFileSync, unlinkSync } from 'fs';
+import { execFileSync } from 'child_process';
+import { writeFileSync, mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -69,15 +69,22 @@ async function platformAPI(method, path, body, token) {
  * Writes SQL to a temp file to avoid shell escaping issues with $$.
  */
 function runSQL(dbName, sql) {
-  const tmpFile = join(tmpdir(), `supabase_test_${Date.now()}.sql`);
-  writeFileSync(tmpFile, sql, 'utf8');
+  const fixtureURL = process.env.DUPABASE_TEST_DATABASE_URL;
+  if (!fixtureURL || !['localhost', '127.0.0.1', '[::1]'].includes(new URL(fixtureURL).hostname)) {
+    throw new Error('Set DUPABASE_TEST_DATABASE_URL to a disposable local database');
+  }
+  const connection = new URL(fixtureURL);
+  connection.pathname = `/${dbName}`;
+  const directory = mkdtempSync(join(tmpdir(), 'dupabase-sdk-'));
+  const tmpFile = join(directory, 'setup.sql');
+  writeFileSync(tmpFile, sql, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
   try {
-    execSync(
-      `psql "postgresql://stech:S0cr%40t123@localhost:15432/${dbName}" -f "${tmpFile}"`,
+    execFileSync(
+      'psql', [connection.toString(), '-X', '-v', 'ON_ERROR_STOP=1', '-f', tmpFile],
       { stdio: 'pipe' },
     );
   } finally {
-    try { unlinkSync(tmpFile); } catch {}
+    rmSync(directory, { recursive: true, force: true });
   }
 }
 

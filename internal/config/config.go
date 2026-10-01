@@ -142,11 +142,13 @@ func getEnvInt(key string, fallback int) int {
 	if v == "" {
 		return fallback
 	}
-	i, err := strconv.Atoi(v)
+	// These settings are also passed to PostgreSQL's int32 pool limits.
+	// Reject out-of-range input before any narrowing conversion.
+	i, err := strconv.ParseInt(v, 10, 32)
 	if err != nil {
 		return fallback
 	}
-	return i
+	return int(i)
 }
 
 func getEnvBool(key string, fallback bool) bool {

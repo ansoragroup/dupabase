@@ -33,6 +33,15 @@ func TestGetEnv_ReturnsEnvValue(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // getEnvInt
+func TestGetEnvIntRejectsNarrowingOverflow(t *testing.T) {
+	for _, value := range []string{"2147483648", "-2147483649", "4294967296"} {
+		t.Setenv("DUPABASE_INT_LIMIT_TEST", value)
+		if got := getEnvInt("DUPABASE_INT_LIMIT_TEST", 42); got != 42 {
+			t.Fatalf("out-of-range input %s became %d", value, got)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 
 func TestGetEnvInt_ReturnsFallback(t *testing.T) {

@@ -14,15 +14,21 @@ import { localTestURL } from './local_fixture.mjs';
  */
 
 import { createClient } from '@supabase/supabase-js';
-import { execSync } from 'child_process';
-import { writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
+import { execFileSync } from 'child_process';
+import { writeFileSync, unlinkSync, existsSync, mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import path from 'path';
 
 const API = localTestURL();
-const PG_HOST = 'localhost';
-const PG_PORT = 15432;
-const PG_USER = 'stech';
-const PG_PASS = 'S0cr%40t123';
+const fixtureDatabase = process.env.DUPABASE_TEST_DATABASE_URL;
+if (!fixtureDatabase || !['localhost', '127.0.0.1', '[::1]'].includes(new URL(fixtureDatabase).hostname)) {
+  throw new Error('Set DUPABASE_TEST_DATABASE_URL to a disposable local database');
+}
+function projectConnection(db) {
+  const url = new URL(fixtureDatabase);
+  url.pathname = `/${db}`;
+  return url.toString();
+}
 
 let passed = 0;
 let failed = 0;
@@ -82,23 +88,20 @@ async function pollUntilDone(token, projectId, taskId, maxWait = 60000) {
 }
 
 function psql(db, sql) {
-  const connStr = `postgresql://${PG_USER}:${PG_PASS}@${PG_HOST}:${PG_PORT}/${db}`;
-  return execSync(`psql "${connStr}" -tA -c "${sql}"`, { stdio: 'pipe' }).toString().trim();
+  return execFileSync('psql', [projectConnection(db), '-X', '-v', 'ON_ERROR_STOP=1', '-tA', '-c', sql], { stdio: 'pipe' }).toString().trim();
 }
 
 function psqlFile(db, filePath) {
-  const connStr = `postgresql://${PG_USER}:${PG_PASS}@${PG_HOST}:${PG_PORT}/${db}`;
-  return execSync(`psql "${connStr}" -f "${filePath}"`, { stdio: 'pipe' }).toString().trim();
+  return execFileSync('psql', [projectConnection(db), '-X', '-v', 'ON_ERROR_STOP=1', '-f', filePath], { stdio: 'pipe' }).toString().trim();
 }
 
 function pgDump(db, outPath, format = 'custom') {
-  const connStr = `postgresql://${PG_USER}:${PG_PASS}@${PG_HOST}:${PG_PORT}/${db}`;
-  execSync(`pg_dump --no-owner --no-acl --format=${format} "${connStr}" -f "${outPath}"`, { stdio: 'pipe' });
+  execFileSync('pg_dump', ['--no-owner', '--no-acl', `--format=${format}`, projectConnection(db), '-f', outPath], { stdio: 'pipe' });
 }
 
 async function run() {
-  const tmpDir = '/tmp/import_test_' + Date.now();
-  mkdirSync(tmpDir, { recursive: true });
+  const tmpDir = mkdtempSync(path.join(tmpdir(), 'dupabase-import-'));
+  process.on('exit', () => rmSync(tmpDir, { recursive: true, force: true }));
 
   console.log('\n========================================');
   console.log('  Import Feature E2E Tests');
@@ -367,7 +370,7 @@ async function run() {
 
   // Cleanup
   try {
-    execSync(`rm -rf ${tmpDir}`, { stdio: 'pipe' });
+    rmSync(tmpDir, { recursive: true, force: true });
   } catch {}
 
   process.exit(failed > 0 ? 1 : 0);
