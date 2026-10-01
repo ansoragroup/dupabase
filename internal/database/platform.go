@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -39,13 +40,27 @@ func NewPlatformPool(ctx context.Context, databaseURL string, maxConns, minConns
 
 // RunMigrations executes SQL migration files against a database pool.
 func RunMigrations(ctx context.Context, pool *pgxpool.Pool, migrations []Migration) error {
+	// Replicas serialize the entire batch. A failed release cannot leave an
+	// earlier migration from that batch committed or race another startup.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin migration batch: %w", err)
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tx.Rollback(cleanup)
+	}()
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(0x44555041)); err != nil {
+		return fmt.Errorf("lock migration batch: %w", err)
+	}
 	// Ensure platform schema exists before tracking migrations
-	if _, err := pool.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS platform`); err != nil {
+	if _, err := tx.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS platform`); err != nil {
 		return fmt.Errorf("create platform schema: %w", err)
 	}
 
 	// Create migrations tracking table in platform schema
-	_, err := pool.Exec(ctx, `
+	_, err = tx.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS platform._migrations (
 			id SERIAL PRIMARY KEY,
 			name VARCHAR(255) NOT NULL UNIQUE,
@@ -59,7 +74,7 @@ func RunMigrations(ctx context.Context, pool *pgxpool.Pool, migrations []Migrati
 	for _, m := range migrations {
 		// Check if already executed
 		var count int
-		err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM platform._migrations WHERE name = $1`, m.Name).Scan(&count)
+		err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM platform._migrations WHERE name = $1`, m.Name).Scan(&count)
 		if err != nil {
 			return fmt.Errorf("check migration %s: %w", m.Name, err)
 		}
@@ -70,26 +85,17 @@ func RunMigrations(ctx context.Context, pool *pgxpool.Pool, migrations []Migrati
 
 		slog.Info("Running migration", "name", m.Name)
 
-		tx, err := pool.Begin(ctx)
-		if err != nil {
-			return fmt.Errorf("begin transaction for migration %s: %w", m.Name, err)
-		}
-
 		if _, err = tx.Exec(ctx, m.SQL); err != nil {
-			tx.Rollback(ctx)
 			return fmt.Errorf("execute migration %s: %w", m.Name, err)
 		}
 
 		if _, err = tx.Exec(ctx, `INSERT INTO platform._migrations (name) VALUES ($1)`, m.Name); err != nil {
-			tx.Rollback(ctx)
 			return fmt.Errorf("record migration %s: %w", m.Name, err)
 		}
-
-		if err = tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit migration %s: %w", m.Name, err)
-		}
 	}
-
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit migration batch: %w", err)
+	}
 	return nil
 }
 

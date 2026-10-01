@@ -8,7 +8,9 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # Build binary
-COPY . .
+COPY cmd ./cmd
+COPY internal ./internal
+COPY migrations ./migrations
 ARG BUILD_REVISION=development
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X github.com/ansoraGROUP/dupabase/internal/server.BuildRevision=${BUILD_REVISION}" -o server ./cmd/server
 
@@ -34,8 +36,10 @@ FROM node:24-alpine
 RUN rm -rf /usr/local/lib/node_modules/npm /opt/yarn-* \
     /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/yarn /usr/local/bin/yarnpkg
 
+# Keep the historical build argument accepted; runtime selection is automatic.
 ARG PG_VERSION=16
-RUN apk --no-cache add ca-certificates tzdata postgresql${PG_VERSION}-client
+RUN apk --no-cache add ca-certificates tzdata \
+    postgresql16-client postgresql17-client postgresql18-client
 
 WORKDIR /app
 

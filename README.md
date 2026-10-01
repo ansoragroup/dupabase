@@ -2,12 +2,12 @@
 
 ### Stop paying $100+/month to Supabase.
 
-![Go 1.25](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)
+![Go 1.27](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![Tests: 318 passing](https://img.shields.io/badge/tests-318%20passing-brightgreen)
+![CI](https://github.com/ansoragroup/dupabase/actions/workflows/deploy.yaml/badge.svg)
 ![Docker](https://img.shields.io/badge/Docker-ready-blue?logo=docker&logoColor=white)
 
-Dupabase is a **Supabase-compatible API middleware** for your own PostgreSQL. It doesn't include a database — you bring your own. Works with the official `@supabase/supabase-js` client with zero code changes.
+Dupabase is a **Supabase-compatible API middleware** for your own PostgreSQL. You bring the database. Supported REST and email/password auth flows work with the official `@supabase/supabase-js` client; see the [tested version and feature matrix](docs/compatibility.md).
 
 ---
 
@@ -19,9 +19,9 @@ Dupabase is a **Supabase-compatible API middleware** for your own PostgreSQL. It
 
 ## The Solution
 
-- **Single Go binary.** Replaces all 15+ Supabase containers with one lightweight process.
+- **One application container.** A Go API backend and Next.js dashboard provide database management, REST, auth and backups.
 - **BYO PostgreSQL.** Dupabase is just the API layer — connect it to your PostgreSQL on any VPS.
-- **Zero code changes.** `@supabase/supabase-js` works unchanged. Literally just change the URL.
+- **Keep your SDK.** Supported Supabase JS calls retain their existing client interfaces; change the URL and project keys.
 
 ## Cost Comparison
 
@@ -154,17 +154,22 @@ Works with `@supabase/supabase-js` out of the box:
 | [Architecture](docs/architecture.md) | How the middleware works |
 | [Migration from Supabase](docs/migration-from-supabase.md) | Step-by-step with cost breakdown |
 | [Backup & Import](docs/backup-and-import.md) | S3 backups and database import |
+| [Compatibility & Upgrades](docs/compatibility.md) | PostgreSQL/SDK versions, upgrade, rollback and performance gates |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues and fixes |
 
 ## Testing
 
-318 integration tests across 4 suites:
+CI runs Go race tests on PostgreSQL 14–18, dashboard checks, and full container
+contracts across three SDK versions. Disposable fixtures are created and cleaned
+up by the runner; existing containers are preserved.
 
 ```bash
-node tests/test_full_compatibility.mjs    # 120 tests — API compatibility
-node tests/test_supabase_dropin.mjs       # 77 tests — drop-in replacement
-node tests/test_import.mjs                # 44 tests — database import
-node tests/test_admin.mjs                 # 77 tests — admin panel & invites
+go test ./cmd/... ./internal/...
+npm ci
+docker build -f .deploy/_shared/Dockerfile -t dupabase:compatibility .
+python3 tests/build_release_baseline.py
+python3 tests/run_compatibility.py --image dupabase:compatibility \
+  --baseline-image dupabase:release-baseline --report compatibility-report.json
 ```
 
 ## Contributing

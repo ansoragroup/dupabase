@@ -751,8 +751,14 @@ func (s *BackupService) executeRestore(taskID int64, dbURL, s3Key string, settin
 		return
 	}
 
-	cmd := exec.CommandContext(ctx, "pg_restore",
+	plan, err := preparePGRestore(ctx, s.db, tmpFile.Name())
+	if err != nil {
+		s.markRestoreFailed(ctx, taskID, fmt.Sprintf("restore compatibility preflight: %v", err))
+		return
+	}
+	cmd := exec.CommandContext(ctx, plan.tool,
 		"--exit-on-error",
+		"--single-transaction",
 		"--exclude-schema=platform",
 		"--no-owner",
 		"--no-acl",
@@ -1075,7 +1081,16 @@ func (s *BackupService) dumpDatabase(ctx context.Context, dbName string, opts Ex
 	args := buildExportArgs(host, port, user, dbName, opts)
 	args = append(args, "--exclude-schema=platform")
 
-	cmd := exec.CommandContext(ctx, "pg_dump", args...)
+	serverMajor, err := pgServerMajor(ctx, s.db)
+	if err != nil {
+		return nil, err
+	}
+	clientMajor, _ := pgClientMajor(serverMajor)
+	tool, err := pgTool(ctx, "pg_dump", clientMajor)
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, tool, args...)
 	cmd.Env = pgCommandEnv(dbURL)
 
 	stdout, err := cmd.StdoutPipe()

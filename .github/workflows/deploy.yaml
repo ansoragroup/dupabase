@@ -8,6 +8,10 @@ on:
 env:
   REGISTRY: ghcr.io
 
+concurrency:
+  group: dupabase-production
+  cancel-in-progress: false
+
 jobs:
   compatibility:
     uses: ./.github/workflows/ci.yaml
@@ -19,10 +23,12 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      packages: read
 
   build-and-push:
     name: Build and push image
-    runs-on: [self-hosted, Linux, X64, ansoragroup-shared]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [compatibility, security]
     permissions:
       contents: read
@@ -36,16 +42,18 @@ jobs:
         id: meta
         run: echo "image_name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      - name: Build exact production candidate
+        run: docker build --file .deploy/_shared/Dockerfile --build-arg BUILD_REVISION="$GITHUB_SHA" --label "org.opencontainers.image.revision=$GITHUB_SHA" --tag dupabase:production .
+
+      - name: Check the image before publishing
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          go-version: '1.27.1'
-
-      - name: Run tests
-        run: go test -race ./cmd/... ./internal/...
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+          version: v0.75.0
+          image-ref: dupabase:production
+          scanners: vuln
+          severity: 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL'
+          ignore-unfixed: false
+          exit-code: '1'
 
       - name: Login to Container Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
@@ -54,19 +62,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
-        with:
-          context: .
-          file: .deploy/_shared/Dockerfile
-          push: true
-          build-args: BUILD_REVISION=${{ github.sha }}
-          labels: org.opencontainers.image.revision=${{ github.sha }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ steps.meta.outputs.image_name }}:prod-latest
-            ${{ env.REGISTRY }}/${{ steps.meta.outputs.image_name }}:prod-${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Publish the checked image
+        env:
+          IMAGE_NAME: ${{ steps.meta.outputs.image_name }}
+        run: |
+          set -eu
+          image="${REGISTRY}/${IMAGE_NAME}"
+          docker tag dupabase:production "$image:prod-$GITHUB_SHA"
+          docker tag dupabase:production "$image:prod-latest"
+          docker push "$image:prod-$GITHUB_SHA"
+          docker push "$image:prod-latest"
 
   deploy:
     name: Deploy

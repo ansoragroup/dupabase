@@ -64,7 +64,7 @@ These apply when creating new projects. Each project can override them in the da
 
 Private S3 endpoints require an operator-approved origin. Public endpoints must resolve to public addresses; redirects are blocked. PostgreSQL command-line workers preserve connection TLS options from `DATABASE_URL`, including verification/certificate settings.
 
-When auto-confirmation is disabled, unconfirmed users receive no session and cannot log in until confirmed. Email delivery/verification workflows must be supplied separately; this maintenance does not add an SMTP provider. Plain SQL import requires PostgreSQL client 16.10 or newer for restricted mode; the container supplies an updated PostgreSQL 16 client.
+When auto-confirmation is disabled, unconfirmed users receive no session and cannot log in until confirmed. Email delivery/verification workflows must be supplied separately. PostgreSQL workers require patched clients 16.15+, 17.11+ or 18.6+; the container supplies all three and selects automatically. Native installations can use `POSTGRES_CLIENT_BIN_ROOT/<major>/<tool>`. See the [compatibility matrix](compatibility.md).
 
 ### Import
 

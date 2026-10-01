@@ -64,3 +64,17 @@ updates:
     open-pull-requests-limit: 10
     commit-message:
       prefix: 'deps(ci)'
+  - package-ecosystem: docker
+    directory: /.deploy/_shared
+    schedule:
+      interval: weekly
+      day: monday
+      time: '08:00'
+      timezone: Asia/Tashkent
+    open-pull-requests-limit: 5
+    groups:
+      container-compatible:
+        patterns: ['*']
+        update-types: [minor, patch]
+    commit-message:
+      prefix: 'deps(container)'

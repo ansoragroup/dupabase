@@ -17,6 +17,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      packages: read
 
   publish:
     name: Publish verified release
@@ -26,6 +27,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -80,7 +82,10 @@ jobs:
           docker tag dupabase:release "$image"
           docker push "$image"
           docker inspect "$image" --format '{{index .RepoDigests 0}}' > image-digest.txt
-          sha256sum image-security.json sbom.cdx.json image-digest.txt > SHA256SUMS
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name compatibility-and-performance --dir release-evidence
+          cp release-evidence/compatibility-report.json compatibility-report.json
+          sha256sum image-security.json sbom.cdx.json image-digest.txt compatibility-report.json > SHA256SUMS
           gh release create "$RELEASE_TAG" --verify-tag --repo "$GITHUB_REPOSITORY" \
             --title "Dupabase ${RELEASE_TAG}" --notes-file "docs/releases/${RELEASE_TAG}.md" \
-            image-security.json sbom.cdx.json image-digest.txt SHA256SUMS
+            image-security.json sbom.cdx.json image-digest.txt compatibility-report.json SHA256SUMS

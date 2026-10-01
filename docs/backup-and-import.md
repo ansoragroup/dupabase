@@ -113,7 +113,11 @@ When importing, Dupabase automatically filters out Supabase-specific auth schema
 - Auth schema grants and permissions
 - Supabase-specific functions and triggers in the auth schema
 
-Your auth **data** (users, sessions) is preserved — only the schema definitions are filtered to prevent conflicts.
+With **Skip Auth Schema** selected, auth schema definitions and auth table data
+are excluded. The separate **Migrate Auth Users** option can import supported
+user records from a plain Supabase SQL dump while retaining password hashes.
+For Dupabase-to-Dupabase backups, restore the complete auth schema and data with
+filtering disabled. Test the migration against the [compatibility matrix](compatibility.md).
 
 ### Import History
 
@@ -136,4 +140,12 @@ Each import is tracked with:
 - This can happen with plain SQL imports that have complex function bodies. Try using custom format (`.dump`) instead.
 
 **PostgreSQL 18 psql commands**
-- pg_dump from PostgreSQL 18 includes `\restrict` and `\unrestrict` meta-commands. Dupabase filters these automatically, but if you're restoring manually, you may need to remove them.
+- Patched PostgreSQL clients emit restricted-mode commands. Dupabase uses its
+  own fresh restriction key for uploaded SQL and preserves public COPY/RLS data.
+  Native clients must be patched; keep the protection when restoring manually.
+
+**Dump/server version mismatch**
+- The target must be the same major or newer than the source. Dupabase checks
+  archive/client versions before clean import. PostgreSQL 14–16 use client 16;
+  PostgreSQL 17/18 use matching clients. A PostgreSQL server downgrade is not an
+  application-image rollback. See [controlled upgrades](compatibility.md).

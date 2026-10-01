@@ -320,6 +320,18 @@ func (s *ImportService) executeImport(taskID int64, dbName, filePath, format str
 		return
 	}
 
+	// Check version compatibility before cleaning data or changing triggers.
+	var restorePlan *pgRestorePlan
+	if format == "custom" {
+		restorePlan, err = preparePGRestore(ctx, s.db, filePath)
+	} else {
+		err = preflightSQLDump(ctx, s.db, filePath)
+	}
+	if err != nil {
+		s.markImportFailed(ctx, taskID, fmt.Sprintf("import compatibility preflight: %v", err))
+		return
+	}
+
 	// Pre-import: handle clean import and disable triggers
 	if opts.CleanImport || opts.DisableTriggers {
 		if err := s.preImport(ctx, dbURL, opts); err != nil {
@@ -347,7 +359,7 @@ func (s *ImportService) executeImport(taskID int64, dbName, filePath, format str
 	var tableCount int
 
 	if format == "custom" {
-		tableCount, importErr = s.importCustomDump(ctx, taskID, dbURL, filePath, opts)
+		tableCount, importErr = s.importCustomDump(ctx, taskID, dbURL, filePath, opts, restorePlan)
 	} else {
 		tableCount, importErr = s.importPlainSQL(ctx, taskID, dbURL, filePath, opts)
 	}
@@ -420,10 +432,13 @@ func (s *ImportService) preImport(ctx context.Context, dbURL string, opts Import
 	}
 
 	sqlStr := strings.Join(stmts, "\n")
-	cmd := exec.CommandContext(ctx, "psql",
+	cmd, err := pgPSQLCommand(ctx,
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		"-c", sqlStr,
 	)
+	if err != nil {
+		return err
+	}
 	cmd.Env = pgCommandEnv(dbURL)
 	out, err := runBoundedCommand(cmd)
 	if err != nil {
@@ -437,10 +452,13 @@ func (s *ImportService) postImport(ctx context.Context, dbURL string) error {
 	if err != nil {
 		return fmt.Errorf("post-import DB URL: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, "psql",
+	cmd, err := pgPSQLCommand(ctx,
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		"-c", "DO $$ DECLARE r RECORD; BEGIN FOR r IN (SELECT schemaname,tablename FROM pg_tables WHERE schemaname='public') LOOP EXECUTE format('ALTER TABLE %I.%I ENABLE TRIGGER USER',r.schemaname,r.tablename); END LOOP; END $$;",
 	)
+	if err != nil {
+		return err
+	}
 	cmd.Env = pgCommandEnv(dbURL)
 	out, err := runBoundedCommand(cmd)
 	if err != nil {
@@ -450,13 +468,13 @@ func (s *ImportService) postImport(ctx context.Context, dbURL string) error {
 }
 
 // importCustomDump handles pg_restore for custom format dumps.
-func (s *ImportService) importCustomDump(ctx context.Context, taskID int64, dbURL, filePath string, opts ImportOptions) (int, error) {
+func (s *ImportService) importCustomDump(ctx context.Context, taskID int64, dbURL, filePath string, opts ImportOptions, plan *pgRestorePlan) (int, error) {
 	cancelCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 
 	if opts.SkipAuthSchema {
 		// Use pg_restore --list to get TOC, filter it, then use --use-list
-		return s.importCustomDumpFiltered(cancelCtx, taskID, dbURL, filePath)
+		return s.importCustomDumpFiltered(cancelCtx, taskID, dbURL, filePath, plan)
 	}
 
 	host, port, user, _, dbName, err := splitDBURL(dbURL)
@@ -465,8 +483,9 @@ func (s *ImportService) importCustomDump(ctx context.Context, taskID int64, dbUR
 	}
 
 	// Direct restore (--clean --if-exists drops before creating)
-	cmd := exec.CommandContext(cancelCtx, "pg_restore",
+	cmd := exec.CommandContext(cancelCtx, plan.tool,
 		"--exit-on-error",
+		"--single-transaction",
 		"--exclude-schema=platform",
 		"--no-owner",
 		"--no-acl",
@@ -494,17 +513,9 @@ func (s *ImportService) importCustomDump(ctx context.Context, taskID int64, dbUR
 }
 
 // importCustomDumpFiltered does TOC-based filtering for custom dumps.
-func (s *ImportService) importCustomDumpFiltered(ctx context.Context, taskID int64, dbURL, filePath string) (int, error) {
-	// Step 1: Get TOC listing
-	listCmd := exec.CommandContext(ctx, "pg_restore", "--list", filePath)
-	listCmd.Env = pgCommandEnv("")
-	tocOutput, err := runBoundedCommand(listCmd)
-	if err != nil {
-		return 0, fmt.Errorf("pg_restore --list: %w", err)
-	}
-
-	// Step 2: Filter TOC
-	filteredTOC := filterTOC(string(tocOutput))
+func (s *ImportService) importCustomDumpFiltered(ctx context.Context, taskID int64, dbURL, filePath string, plan *pgRestorePlan) (int, error) {
+	// Reuse the TOC inspected before destructive pre-import work.
+	filteredTOC := filterTOC(plan.toc)
 
 	// Step 3: Write filtered TOC to temp file
 	tocFile, err := os.CreateTemp("", "import-toc-*.list")
@@ -525,8 +536,9 @@ func (s *ImportService) importCustomDumpFiltered(ctx context.Context, taskID int
 		return 0, fmt.Errorf("parse DB URL: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, "pg_restore",
+	cmd := exec.CommandContext(ctx, plan.tool,
 		"--exit-on-error",
+		"--single-transaction",
 		"--exclude-schema=platform",
 		"--no-owner",
 		"--no-acl",
@@ -574,10 +586,13 @@ func (s *ImportService) importPlainSQL(ctx context.Context, taskID int64, dbURL,
 		return 0, fmt.Errorf("parse DB URL: %w", err)
 	}
 
-	cmd := exec.CommandContext(cancelCtx, "psql",
+	cmd, err := pgPSQLCommand(cancelCtx,
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		"-X", "--set=ON_ERROR_STOP=on",
 	)
+	if err != nil {
+		return 0, err
+	}
 	// Restriction belongs to the worker, not the uploaded dump. On older psql,
 	// the unknown command is fatal, rather than silently running unprotected.
 	keyBytes := make([]byte, 32)
@@ -729,10 +744,13 @@ func countRestoredTables(ctx context.Context, dbURL string) int {
 	if err != nil {
 		return 0
 	}
-	cmd := exec.CommandContext(ctx, "psql",
+	cmd, err := pgPSQLCommand(ctx,
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		"-tAc", "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'",
 	)
+	if err != nil {
+		return 0
+	}
 	cmd.Env = pgCommandEnv(dbURL)
 	out, err := cmd.Output()
 	if err != nil {
@@ -758,7 +776,11 @@ func (s *ImportService) AnalyzeDump(filePath string) (*DumpAnalysis, int, error)
 		// For custom format, use pg_restore --list to get TOC and analyze it
 		analysisCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(analysisCtx, "pg_restore", "--list", filePath)
+		tool, err := pgLatestTool(analysisCtx, "pg_restore")
+		if err != nil {
+			return nil, http.StatusInternalServerError, err
+		}
+		cmd := exec.CommandContext(analysisCtx, tool, "--list", filePath)
 		cmd.Env = pgCommandEnv("")
 		tocOutput, err := runBoundedCommand(cmd)
 		if err != nil {
@@ -1058,10 +1080,13 @@ func insertMigratedUsers(ctx context.Context, dbURL string, users []supabaseAuth
 	}
 	tmpFile.Close()
 
-	cmd := exec.CommandContext(ctx, "psql",
+	cmd, err := pgPSQLCommand(ctx,
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		"-f", tmpFile.Name(),
 	)
+	if err != nil {
+		return 0, err
+	}
 	cmd.Env = pgCommandEnv(dbURL)
 	out, err := runBoundedCommand(cmd)
 	if err != nil {
@@ -1070,10 +1095,13 @@ func insertMigratedUsers(ctx context.Context, dbURL string, users []supabaseAuth
 	}
 
 	// Count how many were actually inserted
-	countCmd := exec.CommandContext(ctx, "psql",
+	countCmd, err := pgPSQLCommand(ctx,
 		"--host="+host, "--port="+port, "--username="+user, "--dbname="+dbName,
 		"-tAc", "SELECT count(*) FROM auth.users",
 	)
+	if err != nil {
+		return 0, err
+	}
 	countCmd.Env = pgCommandEnv(dbURL)
 	countOut, err := countCmd.Output()
 	if err != nil {
