@@ -538,6 +538,9 @@ func buildExportArgs(host, port, user, dbName string, opts ExportOptions) []stri
 
 	args := []string{
 		"--format=" + pgFormat,
+		// Authenticate as the confined project login, then use its existing
+		// service membership so FORCE RLS tables are exported completely.
+		"--role=service_role",
 		"--exclude-schema=platform",
 		"--no-owner",
 		"--no-acl",
@@ -775,6 +778,12 @@ func (s *BackupService) executeRestore(taskID int64, dbURL, s3Key string, settin
 		s.markRestoreFailed(ctx, taskID, fmt.Sprintf("pg_restore: %s", outStr))
 		return
 
+	}
+	if s.poolManager != nil {
+		if err := s.poolManager.ReconcileProjectDatabase(ctx, dbName); err != nil {
+			s.markRestoreFailed(ctx, taskID, fmt.Sprintf("reconcile restored project: %v", err))
+			return
+		}
 	}
 
 	tableCount := countRestoredTables(ctx, dbURL)

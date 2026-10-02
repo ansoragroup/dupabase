@@ -200,7 +200,7 @@ func TestBuildExportArgs(t *testing.T) {
 		{
 			"default_custom",
 			ExportOptions{Format: "custom"},
-			[]string{"--format=custom", "--no-owner", "--no-acl"},
+			[]string{"--format=custom", "--role=service_role", "--no-owner", "--no-acl"},
 			[]string{"--schema-only", "--data-only", "--inserts", "--exit-on-error"},
 		},
 		{

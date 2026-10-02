@@ -59,6 +59,9 @@ func (pm *PoolManager) ProjectDatabaseURL(ctx context.Context, dbName string) (s
 	if _, err := pm.GetPool(ctx, id); err != nil {
 		return "", err
 	}
+	if err := pm.ReconcileProjectDatabase(ctx, dbName); err != nil {
+		return "", err
+	}
 	return pm.projectURL(id, dbName), nil
 }
 
@@ -117,16 +120,92 @@ func (pm *PoolManager) ProvisionProjectLogin(ctx context.Context, projectID, dbN
 	if _, err = tx.Exec(ctx, projectOwnershipSQL); err != nil {
 		return fmt.Errorf("confine project ownership: %w", err)
 	}
+	if _, err = tx.Exec(ctx, projectServiceAccessSQL); err != nil {
+		return fmt.Errorf("restore project service access: %w", err)
+	}
 	if _, err = tx.Exec(ctx, "GRANT ALL ON SCHEMA public, auth TO "+quoted); err != nil {
 		return err
 	}
 	for _, kind := range []string{"TABLES", "SEQUENCES", "ROUTINES"} {
-		if _, err = tx.Exec(ctx, "ALTER DEFAULT PRIVILEGES FOR ROLE "+quoted+" IN SCHEMA public GRANT ALL ON "+kind+" TO anon, authenticated, service_role"); err != nil {
+		grantees := "service_role"
+		// Initialize enduser defaults once. Subsequent reconciliation must
+		// preserve explicit customer revokes, including those in imported SQL.
+		if !exists {
+			grantees = "anon, authenticated, service_role"
+		}
+		if _, err = tx.Exec(ctx, "ALTER DEFAULT PRIVILEGES FOR ROLE "+quoted+" IN SCHEMA public GRANT ALL ON "+kind+" TO "+grantees); err != nil {
 			return err
 		}
 	}
 	return tx.Commit(ctx)
 }
+
+// ReconcileProjectDatabase repairs application ownership and service access
+// after an import/restore, including when the project's API pool is already open.
+func (pm *PoolManager) ReconcileProjectDatabase(ctx context.Context, dbName string) error {
+	var projectID, accountLogin string
+	if err := pm.platformPool.QueryRow(ctx, `SELECT p.id, u.pg_username
+		FROM platform.projects p JOIN platform.pg_users u ON u.id = p.pg_user_id
+		WHERE p.db_name = $1 AND p.status = 'active'`, dbName).Scan(&projectID, &accountLogin); err != nil {
+		return fmt.Errorf("active project not found: %w", err)
+	}
+	return pm.ProvisionProjectLogin(ctx, projectID, dbName, accountLogin)
+}
+
+// A confined login never gains BYPASSRLS. The service role needs existing-object
+// ACLs as well as future default privileges. Its SECURITY DEFINER functions and
+// owner views must retain service access on FORCE RLS tables while ordinary API
+// roles retain their policies. The actual SET ROLE state cannot be changed from
+// inside SECURITY DEFINER; mutable JWT claim settings are not authorization.
+// The policy contains no project role names, so it survives cross-project import.
+const projectServiceAccessSQL = `DO $service_access$
+DECLARE obj record; policy record; using_expr text; check_expr text;
+BEGIN
+  FOR obj IN SELECT n.oid, n.nspname FROM pg_namespace n
+    WHERE left(n.nspname,3) <> 'pg_' AND n.nspname NOT IN ('information_schema','platform','extensions')
+      AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid='pg_namespace'::regclass AND d.objid=n.oid AND d.deptype='e')
+  LOOP
+    EXECUTE format('GRANT USAGE ON SCHEMA %I TO service_role', obj.nspname);
+  END LOOP;
+  FOR obj IN SELECT c.oid, n.nspname, c.relname, c.relkind, c.relforcerowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE left(n.nspname,3) <> 'pg_' AND n.nspname NOT IN ('information_schema','platform','extensions')
+      AND c.relkind IN ('r','p','v','m','S','f')
+      AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
+  LOOP
+    EXECUTE format('GRANT ALL ON %s %I.%I TO service_role', CASE obj.relkind WHEN 'S' THEN 'SEQUENCE' ELSE 'TABLE' END, obj.nspname, obj.relname);
+    IF obj.relkind IN ('r','p') AND obj.relforcerowsecurity AND NOT EXISTS (
+      SELECT 1 FROM pg_policy WHERE polrelid=obj.oid AND polname='__dupabase_service_definer'
+    ) THEN
+      EXECUTE format('CREATE POLICY __dupabase_service_definer ON %I.%I AS PERMISSIVE FOR ALL TO PUBLIC USING (pg_catalog.current_setting(''role'',true)=''service_role'') WITH CHECK (pg_catalog.current_setting(''role'',true)=''service_role'')', obj.nspname, obj.relname);
+    END IF;
+    IF obj.relkind IN ('r','p') AND obj.relforcerowsecurity THEN
+      -- Restrictive policies are ANDed with permissive ones. Retain their
+      -- original client predicates while allowing the actual service role,
+      -- which already bypasses these policies on direct table operations.
+      FOR policy IN SELECT polname, pg_get_expr(polqual,polrelid) qual, pg_get_expr(polwithcheck,polrelid) check_qual
+        FROM pg_policy WHERE polrelid=obj.oid AND NOT polpermissive
+      LOOP
+        using_expr := policy.qual; check_expr := policy.check_qual;
+        IF using_expr IS NOT NULL AND using_expr !~ '^\(\((pg_catalog\.)?current_setting\(''role''::text, true\) = ''service_role''::text\) OR ' THEN
+          EXECUTE format('ALTER POLICY %I ON %I.%I USING (pg_catalog.current_setting(''role'',true)=''service_role'' OR (%s))', policy.polname, obj.nspname, obj.relname, using_expr);
+        END IF;
+        IF check_expr IS NOT NULL AND check_expr !~ '^\(\((pg_catalog\.)?current_setting\(''role''::text, true\) = ''service_role''::text\) OR ' THEN
+          EXECUTE format('ALTER POLICY %I ON %I.%I WITH CHECK (pg_catalog.current_setting(''role'',true)=''service_role'' OR (%s))', policy.polname, obj.nspname, obj.relname, check_expr);
+        END IF;
+      END LOOP;
+    END IF;
+  END LOOP;
+  FOR obj IN SELECT oid FROM pg_largeobject_metadata
+  LOOP
+    EXECUTE format('GRANT SELECT, UPDATE ON LARGE OBJECT %s TO service_role', obj.oid);
+  END LOOP;
+  FOR obj IN SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid) args FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+    WHERE left(n.nspname,3) <> 'pg_' AND n.nspname NOT IN ('information_schema','platform','extensions')
+      AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid='pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e')
+  LOOP
+    EXECUTE format('GRANT EXECUTE ON ROUTINE %I.%I(%s) TO service_role', obj.nspname, obj.proname, obj.args);
+  END LOOP;
+END $service_access$;`
 
 // set_config passes the login as data, so the ownership block stays constant.
 var projectOwnershipSQL = strings.Join([]string{
@@ -134,14 +213,14 @@ var projectOwnershipSQL = strings.Join([]string{
 DECLARE obj record; owner_name text := current_setting('dupabase.project_owner');
 BEGIN
   FOR obj IN SELECT n.oid, n.nspname FROM pg_namespace n
-    WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname NOT IN ('information_schema','platform','extensions')
+    WHERE left(n.nspname,3) <> 'pg_' AND n.nspname NOT IN ('information_schema','platform','extensions')
       AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid='pg_namespace'::regclass AND d.objid=n.oid AND d.deptype='e')
       AND n.nspowner <> owner_name::regrole
   LOOP
     EXECUTE format('ALTER SCHEMA %I OWNER TO %I', obj.nspname, owner_name);
   END LOOP;
   FOR obj IN SELECT n.nspname, c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-    WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname NOT IN ('information_schema','platform','extensions')
+    WHERE left(n.nspname,3) <> 'pg_' AND n.nspname NOT IN ('information_schema','platform','extensions')
       AND c.relkind IN ('r','p','v','m','S','f')
       AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')
       AND c.relowner <> owner_name::regrole
@@ -150,7 +229,7 @@ BEGIN
     EXECUTE format('ALTER %s %I.%I OWNER TO %I', CASE obj.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'S' THEN 'SEQUENCE' WHEN 'f' THEN 'FOREIGN TABLE' ELSE 'TABLE' END, obj.nspname, obj.relname, owner_name);
   END LOOP;
   FOR obj IN SELECT n.nspname, p.proname, p.prokind, pg_get_function_identity_arguments(p.oid) args FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-    WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname NOT IN ('information_schema','platform','extensions')
+    WHERE left(n.nspname,3) <> 'pg_' AND n.nspname NOT IN ('information_schema','platform','extensions')
       AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid='pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e')
       AND p.proowner <> owner_name::regrole
   LOOP
@@ -158,12 +237,16 @@ BEGIN
   END LOOP;
   FOR obj IN SELECT n.nspname, t.typname, t.typtype FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace
     LEFT JOIN pg_class c ON c.oid=t.typrelid
-    WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname NOT IN ('information_schema','platform','extensions')
+    WHERE left(n.nspname,3) <> 'pg_' AND n.nspname NOT IN ('information_schema','platform','extensions')
       AND (t.typtype IN ('e','d','r') OR (t.typtype='c' AND c.relkind='c'))
       AND t.typowner <> owner_name::regrole
       AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid='pg_type'::regclass AND d.objid=t.oid AND d.deptype='e')
   LOOP
     EXECUTE format('ALTER %s %I.%I OWNER TO %I', CASE obj.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END, obj.nspname, obj.typname, owner_name);
+  END LOOP;
+  FOR obj IN SELECT oid FROM pg_largeobject_metadata WHERE lomowner <> owner_name::regrole
+  LOOP
+    EXECUTE format('ALTER LARGE OBJECT %s OWNER TO %I', obj.oid, owner_name);
   END LOOP;
 END $ownership$;`,
 }, "\n")

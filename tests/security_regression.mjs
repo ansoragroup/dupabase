@@ -211,6 +211,16 @@ CREATE ROLE this_is_copy_data
 \\.
 ALTER TABLE public.imported ENABLE ROW LEVEL SECURITY;
 CREATE POLICY deny_public ON public.imported USING (false);
+CREATE TABLE public.forced_imported (id text PRIMARY KEY);
+COPY public.forced_imported (id) FROM stdin;
+forced-row
+\\.
+ALTER TABLE public.forced_imported ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.forced_imported FORCE ROW LEVEL SECURITY;
+CREATE POLICY deny_forced_public ON public.forced_imported USING (false);
+CREATE POLICY restrict_forced_public ON public.forced_imported AS RESTRICTIVE TO PUBLIC USING (false) WITH CHECK(false);
+CREATE VIEW public.forced_imported_view AS SELECT * FROM public.forced_imported;
+CREATE FUNCTION public.forced_imported_count() RETURNS integer LANGUAGE sql SECURITY DEFINER AS $$ SELECT count(*)::integer FROM public.forced_imported $$;
 `,'legitimate.sql');
   check(imported.status==='completed',`legitimate dump/COPY import: ${imported.error_message}`);
   const importedRows=await sql(importTarget,'SELECT id FROM public.imported');
@@ -219,6 +229,19 @@ CREATE POLICY deny_public ON public.imported USING (false);
   check(rls.data.rows[0][0]===true,'import preserves RLS catalog state');
   const noRows=await client(importTarget).from('imported').select('*');
   check(!noRows.error && noRows.data.length===0,'import preserves anonymous RLS visibility');
+  async function checkForcedAccess(project, phase) {
+    const server=client(project,project.service_role_key);
+    const anonymous=client(project);
+    const rows=await server.from('forced_imported_view').select('*');
+    check(!rows.error && rows.data.length===1 && rows.data[0].id==='forced-row',`${phase}: service owner-view sees complete forced data`);
+    const definer=await server.rpc('forced_imported_count');
+    check(!definer.error && definer.data[0].forced_imported_count===1,`${phase}: service definer reads forced data`);
+    const hidden=await anonymous.from('forced_imported_view').select('*');
+    check(!hidden.error && hidden.data.length===0,`${phase}: anonymous owner-view stays restricted`);
+    const hiddenDefiner=await anonymous.rpc('forced_imported_count');
+    check(!hiddenDefiner.error && hiddenDefiner.data[0].forced_imported_count===0,`${phase}: anonymous definer stays restricted`);
+  }
+  await checkForcedAccess(importTarget,'plain import');
   const shell=await upload(importTarget,"\\! printf untrusted-shell-command\n",'unsafe.sql');
   check(shell.status==='failed' && /restricted|restrict/i.test(shell.error_message),'psql rejects uploaded shell commands');
   const forbiddenServerSql=await upload(importTarget,'CREATE ROLE forbidden_import_role;\n','unsafe-role.sql',false);
@@ -226,6 +249,9 @@ CREATE POLICY deny_public ON public.imported USING (false);
 
   check((await sql(importTarget, "CREATE TABLE public.auth (id text PRIMARY KEY)")).status===200,'create export fixture table');
   check((await sql(importTarget, "INSERT INTO public.auth VALUES ('public-data')")).status===200,'populate export fixture table');
+  const largeObject=await sql(importTarget,"SELECT lo_from_bytea(0,decode('666f726365642d626c6f62','hex'))");
+  const largeObjectID=largeObject.data.rows[0][0];
+  check(largeObject.status===200 && Number.isInteger(largeObjectID),'project-owned large object created before export');
   const exported = await fetch(`${base}/platform/projects/${importTarget.id}/export?format=custom`,{headers:{Authorization:`Bearer ${token}`}});
   check(exported.ok,'custom export remains available with restricted credentials');
   const customDump = new Uint8Array(await exported.arrayBuffer());
@@ -235,6 +261,15 @@ CREATE POLICY deny_public ON public.imported USING (false);
   check(custom.status==='completed',`custom import remains compatible: ${custom.error_message}`);
   const publicAuth = await sql(customTarget,'SELECT id FROM public.auth');
   check(publicAuth.status===200 && publicAuth.data.rows[0][0]==='public-data',`custom filtering preserves a public table named auth: ${JSON.stringify(publicAuth)}`);
+  await checkForcedAccess(customTarget,'cross-project custom import');
+  const importedBlob=await sql(customTarget,`SELECT encode(lo_get(${largeObjectID}),'hex')`);
+  check(importedBlob.status===200 && importedBlob.data.rows[0][0]==='666f726365642d626c6f62','custom export/import preserves project large objects');
+  const defaultsTarget=await createProject('private-defaults');
+  const privateDefaults=await upload(defaultsTarget,'ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon,authenticated;\n','private-defaults.sql');
+  check(privateDefaults.status==='completed','explicit private defaults import succeeds');
+  await sql(defaultsTarget,'CREATE TABLE public.private_after_import(id integer)');
+  const defaultACL=await sql(defaultsTarget,"SELECT has_table_privilege('anon','public.private_after_import','SELECT'),has_table_privilege('authenticated','public.private_after_import','SELECT')");
+  check(defaultACL.status===200 && defaultACL.data.rows[0].every(value=>value===false),'import reconciliation preserves customer enduser default revokes');
 
   // Cancellation must survive the worker's eventual error and restore triggers.
   check((await sql(customTarget, "CREATE TABLE public.trigger_probe (id int)")).status===200,'create trigger table');
@@ -298,6 +333,7 @@ CREATE POLICY deny_public ON public.imported USING (false);
     check(recovered.status===200 && recovered.data.rows[0][0]==='public-data','restore recovers actual saved data');
     const restoredRLS=await client(importTarget).from('imported').select('*');
     check(!restoredRLS.error && restoredRLS.data.length===0,'backup restore preserves RLS');
+    await checkForcedAccess(importTarget,'backup restore');
     await request('/platform/backups/settings',{method:'PATCH',body:{enabled:false,platform_password:password}});
   }
 

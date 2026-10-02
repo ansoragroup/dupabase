@@ -117,7 +117,27 @@ CREATE DOMAIN public.legacy_label AS text CHECK (length(VALUE)>0);
 CREATE TYPE public.legacy_pair AS (key text,value text);
 CREATE TABLE public.legacy_records (id bigserial PRIMARY KEY, state public.legacy_state, label public.legacy_label);
 INSERT INTO public.legacy_records(state,label) VALUES ('saved','preserved');
+REVOKE ALL ON public.legacy_records FROM anon,authenticated,service_role;
+REVOKE ALL ON SEQUENCE public.legacy_records_id_seq FROM anon,authenticated,service_role;
 CREATE FUNCTION public.legacy_value() RETURNS text LANGUAGE sql AS $$ SELECT 'original'::text $$;
+CREATE TABLE public.legacy_forced (owner_id uuid PRIMARY KEY, label text);
+INSERT INTO public.legacy_forced VALUES
+  ('11111111-1111-4111-8111-111111111111','first'),
+  ('22222222-2222-4222-8222-222222222222','second');
+ALTER TABLE public.legacy_forced ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.legacy_forced FORCE ROW LEVEL SECURITY;
+CREATE POLICY own_rows ON public.legacy_forced TO authenticated USING(owner_id=auth.uid());
+CREATE POLICY restrict_own_rows ON public.legacy_forced AS RESTRICTIVE TO PUBLIC USING(owner_id=auth.uid()) WITH CHECK(owner_id=auth.uid());
+GRANT SELECT ON public.legacy_forced TO anon,authenticated;
+CREATE VIEW public.legacy_forced_view AS SELECT * FROM public.legacy_forced;
+GRANT SELECT ON public.legacy_forced_view TO anon,authenticated;
+CREATE FUNCTION public.legacy_forced_count() RETURNS bigint LANGUAGE sql SECURITY DEFINER AS $$ SELECT count(*) FROM public.legacy_forced $$;
+CREATE FUNCTION public.legacy_claim_spoof() RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN PERFORM set_config('request.jwt.claim.role','service_role',true); RETURN (SELECT count(*) FROM public.legacy_forced); END $$;
+CREATE SCHEMA pgapp;
+GRANT USAGE ON SCHEMA pgapp TO PUBLIC;
+CREATE TABLE pgapp.legacy_data(id integer);
+INSERT INTO pgapp.legacy_data VALUES(1);
+CREATE FUNCTION pgapp.legacy_identity() RETURNS text LANGUAGE sql SECURITY DEFINER AS $$ SELECT current_user::text $$;
 `)
 	operator.Close()
 	if err != nil {
@@ -135,6 +155,9 @@ CREATE FUNCTION public.legacy_value() RETURNS text LANGUAGE sql AS $$ SELECT 'or
 		}
 		if err := pool.QueryRow(ctx, `SELECT label FROM public.legacy_records`).Scan(&label); err != nil || label != "preserved" {
 			t.Fatalf("legacy data: %v", err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT pgapp.legacy_identity()`).Scan(&label); err != nil || label != projectLogin {
+			t.Fatalf("legacy custom schema retained operator identity: %s %v", label, err)
 		}
 		if _, err := pool.Exec(ctx, `ALTER TYPE public.legacy_state ADD VALUE 'new'; ALTER DOMAIN public.legacy_label DROP CONSTRAINT legacy_label_check; ALTER TYPE public.legacy_pair ADD ATTRIBUTE extra text; CREATE OR REPLACE FUNCTION public.legacy_value() RETURNS text LANGUAGE sql AS $$ SELECT 'updated'::text $$;`); err != nil {
 			t.Fatalf("legacy object ownership: %v", err)
@@ -157,6 +180,80 @@ CREATE FUNCTION public.legacy_value() RETURNS text LANGUAGE sql AS $$ SELECT 'or
 		defer direct.Close(ctx)
 		if _, err := direct.Exec(ctx, `INSERT INTO public.legacy_records(state,label) VALUES ('new','direct-client')`); err != nil {
 			t.Fatalf("direct client CRUD: %v", err)
+		}
+	})
+	t.Run("legacy service access preserves forced RLS and enduser isolation", func(t *testing.T) {
+		pool, err := pm.GetPool(ctx, projectID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var publicRead, userRead bool
+		if err := pool.QueryRow(ctx, `SELECT has_table_privilege('anon','public.legacy_records','SELECT'),has_table_privilege('authenticated','public.legacy_records','SELECT')`).Scan(&publicRead, &userRead); err != nil || publicRead || userRead {
+			t.Fatalf("legacy ACLs expanded for endusers: anon=%v user=%v err=%v", publicRead, userRead, err)
+		}
+		for _, tc := range []struct {
+			role, sub           string
+			base, view, definer int64
+		}{
+			{"service_role", "", 2, 2, 2},
+			{"anon", "", 0, 0, 0},
+			{"authenticated", "11111111-1111-4111-8111-111111111111", 1, 0, 0},
+			{"authenticated", "22222222-2222-4222-8222-222222222222", 1, 0, 0},
+		} {
+			t.Run(tc.role+tc.sub, func(t *testing.T) {
+				_, err := database.ExecuteWithRLS(ctx, pool, tc.role, database.JWTClaims{"role": tc.role, "sub": tc.sub}, func(tx pgx.Tx) (bool, error) {
+					var base, view, definer, spoof int64
+					if err := tx.QueryRow(ctx, `SELECT (SELECT count(*) FROM public.legacy_forced),(SELECT count(*) FROM public.legacy_forced_view),public.legacy_forced_count(),public.legacy_claim_spoof()`).Scan(&base, &view, &definer, &spoof); err != nil {
+						return false, err
+					}
+					if base != tc.base || view != tc.view || definer != tc.definer || spoof != tc.definer {
+						return false, fmt.Errorf("visibility base=%d view=%d definer=%d spoof=%d", base, view, definer, spoof)
+					}
+					if tc.role == "service_role" {
+						var count int
+						if err := tx.QueryRow(ctx, `SELECT count(*) FROM public.legacy_records`).Scan(&count); err != nil || count != 2 {
+							return false, fmt.Errorf("legacy service ACL: count=%d err=%v", count, err)
+						}
+					}
+					return true, nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+		if _, err := pool.Exec(ctx, `CREATE OR REPLACE FUNCTION public.legacy_forced_count() RETURNS bigint LANGUAGE sql SECURITY DEFINER AS $$ SELECT count(*) FROM public.legacy_forced $$;`); err != nil {
+			t.Fatalf("definer DDL ownership changed: %v", err)
+		}
+		if err := pm.ReconcileProjectDatabase(ctx, project.DBName); err != nil {
+			t.Fatal(err)
+		}
+		var originalPolicy string
+		if err := pool.QueryRow(ctx, `SELECT pg_get_expr(polqual,polrelid) FROM pg_policy WHERE polrelid='public.legacy_forced'::regclass AND polname='restrict_own_rows'`).Scan(&originalPolicy); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM anon,authenticated;`); err != nil {
+			t.Fatal(err)
+		}
+		pm.ClosePool(projectID)
+		pool, err = pm.GetPool(ctx, projectID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var afterPolicy string
+		if err := pool.QueryRow(ctx, `SELECT pg_get_expr(polqual,polrelid) FROM pg_policy WHERE polrelid='public.legacy_forced'::regclass AND polname='restrict_own_rows'`).Scan(&afterPolicy); err != nil || afterPolicy != originalPolicy {
+			t.Fatalf("restrictive policy grew during pool recreation: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `CREATE TABLE public.private_after_reconcile(id integer);`); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT has_table_privilege('anon','public.private_after_reconcile','SELECT'),has_table_privilege('authenticated','public.private_after_reconcile','SELECT')`).Scan(&publicRead, &userRead); err != nil || publicRead || userRead {
+			t.Fatalf("customer default revokes lost: anon=%v user=%v err=%v", publicRead, userRead, err)
+		}
+		var policyCount int
+		var bypass, inherit bool
+		if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM pg_policy WHERE polrelid='public.legacy_forced'::regclass AND polname='__dupabase_service_definer'),rolbypassrls,rolinherit FROM pg_roles WHERE rolname=session_user`).Scan(&policyCount, &bypass, &inherit); err != nil || policyCount != 1 || bypass || inherit {
+			t.Fatalf("reconciliation or login boundary: policies=%d bypass=%v inherit=%v err=%v", policyCount, bypass, inherit, err)
 		}
 	})
 	t.Run("operator granted custom API roles survive pool recreation", func(t *testing.T) {

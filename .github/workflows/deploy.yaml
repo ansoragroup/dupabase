@@ -86,9 +86,10 @@ jobs:
           WATCHTOWER_TOKEN: ${{ secrets.WATCHTOWER_TOKEN }}
         run: |
           set -eu
+          image="${REGISTRY}/${GITHUB_REPOSITORY,,}"
           curl --fail --silent --show-error --max-time 120 --output /dev/null \
                -H "Authorization: Bearer ${WATCHTOWER_TOKEN}" \
-               --request POST "${WATCHTOWER_ENDPOINT%/}/v1/update"
+               --request POST "${WATCHTOWER_ENDPOINT%/}/v1/update?image=${image}"
 
       - name: Verify deployment
         env:

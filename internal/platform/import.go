@@ -373,6 +373,12 @@ func (s *ImportService) executeImport(taskID int64, dbName, filePath, format str
 		s.markImportFailed(ctx, taskID, importErr.Error())
 		return
 	}
+	if s.poolManager != nil {
+		if err := s.poolManager.ReconcileProjectDatabase(ctx, dbName); err != nil {
+			s.markImportFailed(ctx, taskID, fmt.Sprintf("reconcile imported project: %v", err))
+			return
+		}
+	}
 
 	// Migrate auth users if requested (run on the original file before cleanup)
 	if opts.MigrateAuthUsers {
