@@ -16,6 +16,6 @@
   "license": "MIT",
   "type": "commonjs",
   "dependencies": {
-    "@supabase/supabase-js": "^2.117.2"
+    "@supabase/supabase-js": "^2.117.3"
   }
 }
