@@ -15,7 +15,7 @@ ARG BUILD_REVISION=development
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X github.com/ansoraGROUP/dupabase/internal/server.BuildRevision=${BUILD_REVISION}" -o server ./cmd/server
 
 # Stage 2: Build Next.js dashboard
-FROM node:24-alpine AS next-builder
+FROM node:26-alpine AS next-builder
 
 WORKDIR /app
 
@@ -30,7 +30,7 @@ RUN npm run build
 
 # Stage 3: Production
 # Use the supported Node.js LTS line in both build and runtime stages.
-FROM node:24-alpine
+FROM node:26-alpine
 
 # The standalone dashboard runs with node; package managers are build-only.
 RUN rm -rf /usr/local/lib/node_modules/npm /opt/yarn-* \
